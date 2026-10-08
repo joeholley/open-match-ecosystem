@@ -4,11 +4,8 @@ This example matchmaker is a golang application designed to be built using [CNCF
 
 ## Build
 
-This repo includes the files required to build [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds).  A typical build goes something like this, with the repo cloned,  `gcloud` initialized, and an existing [Docker Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images) called `myregistry`:
-```
-# Update the dependencies to the latest versions and kick off a Cloud Build
-go get && go mod tidy && gcloud builds submit --async --substitutions=COMMIT_SHA=abc123
-```
+This repo includes the files required to build [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds) in the `<open-match-ecosystem>/v2/` directory.
+
 There is no `cloudbuild.yaml` or `Dockerfile` required for this. [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) takes care of everything.
 
 ## Deploy
@@ -69,8 +66,6 @@ The behavior of the example matchmaker can be controlled with environment variab
 * `MM_CYCLE_MIN_DURATION_MS=5000` (default `5000`) - Minimum duration in milliseconds for each matchmaking cycle. Should be set `>=` your observed p99 `om_core.cache.replication.lag` so ticket deactivations and re-activations have time to replicate across `om-core` instances before the next cycle begins. When cross-cycle ticket collisions or `deactivation_timeout` annotations occur, `gsdirector` adaptively multiplies this sleep duration (`assignedBackoffFactor`) to give `om-core` replication time to catch up.
 * `OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500` (default `500`) - Maximum number of ticket IDs sent in a single `ActivateTickets` call. Must be `<=` `om-core`'s `OM_MAX_STATE_UPDATES_PER_CALL` (default `500`), which also bounds the number of ticket IDs packed into a single replication stream entry when `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` on `om-core`.
 * `NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT` (default `math.MaxInt32`) - Causes `gsdirector` to exit `Run()` after N consecutive matchmaking cycles with zero match proposals. Useful for deterministic exit in local testing and automated load tests.
-
-For instructions on running replication and tickets-per-cycle (TPC) load tests against `om-core`, see [LOADTEST.md](./LOADTEST.md).
 
 Note that the example matchmaker is an example of **all of the pieces of code you'll need to write and maintain on your own** in order to make a matchmaker using Open Match 2.  It is **explicitly not** an example of how that code should be packaged for production. In particular, in production you will want to make horizontally scalable services out of your matchmaking queue and your matchmaking functions with enough instances to handle all the load from all of your game clients requesting matches, and you very likely do **not** want to run dozens of identical copies of your game server manager and director. The `v2/examples/standalone` directory contains individual copies of the components as a model for how to package and deploy your matchmaker in production.  However, spinning up 5+ microservices on your local machine and getting them all talking to each other successfully is a lot of friction when you're trying to quickly iterate on your matching logic and ticket parameters during development.  This 'all-in-one' matchmaker application spins up all the actual code you would run as services in production inside one process and allows you to quickly pin down your matchmaking approach without having to 'port' all your code into a new codebase before running it in production. (For users of the 'original' Open Match: this application is analogous to `minimatch`.)
 

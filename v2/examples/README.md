@@ -118,9 +118,3 @@ Understanding why a ticket collision occurred requires distinguishing between **
 | Throughput plateau vs TPC | `om_core.cache.outgoing.updates`, `om_core.cache.incoming.polls.full` | Candidate for enabling `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` (only after all `om-core` instances are upgraded). |
 
    * **Remediation**: If `om_core.cache.replication.lag` or `om_core.mmf.deactivation.timeouts` is elevated, tune `MM_CYCLE_MIN_DURATION_MS` so it stays above p99 `om_core.cache.replication.lag`, reduce per-cycle MMF fan-out, scale `om-core` / Redis, or enable `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` to pack multi-ticket state updates into single Redis Stream entries (**important**: only enable `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` after all `om-core` instances reading from the same Redis instance have been upgraded to a version that supports packed stream entries).
-
-### **End-to-End (E2E) and Load Testing**
-
-* **Automated 6-Stage E2E Test Suite ([`../e2e/README.md`](../e2e/README.md))**: Validates `om-core` and the v2 ecosystem components across 6 stages (monolithic baseline, cross-instance Redis replication, packed ticket updates, deactivation timeout resilience, partial activation error handling, and decoupled microservices with Cloud Pub/Sub). It can be executed either on a live GCP project using Cloud Build + Cloud Run (`../e2e/cloudbuild-e2e.yaml`) against a pre-built `om-core` image tag, or locally in-memory (`go run ./e2e/cmd/e2e-runner --local`).
-* **Interactive TPC Load Testing ([`matchmaker/LOADTEST.md`](matchmaker/LOADTEST.md))**: Step-by-step guide and helper script (`../hack/loadtest.sh`) for ramping tickets-per-cycle (TPC) and fault injection against a local `om-core` instance.
-
