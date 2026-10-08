@@ -29,4 +29,13 @@ const (
 	// https://agones.dev/site/docs/integration-patterns/high-density-gameservers/
 	AgonesGSReadyKey      = "agones.dev/sdk-gs-session-ready"
 	AgonesGSReadyCountKey = "open-match.dev/agones-game-server-ready-count"
+
+	// MatchDeactivationTimeoutKey is set by om-core (as google.protobuf.BoolValue(true))
+	// on a returned pb.Match's Extensions map when OM_MATCH_TICKET_DEACTIVATION_WAIT=true
+	// and waiting for the match's ticket deactivations to replicate to om-core's local
+	// cache timed out (OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS), or when all deactivation
+	// writes for the match failed to yield a replication ID.
+	// Reserved for om-core: MMFs must not populate this key. Must match
+	// MatchDeactivationTimeoutExtensionKey in om-core.
+	MatchDeactivationTimeoutKey = "deactivation_timeout"
 )

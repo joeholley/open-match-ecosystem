@@ -52,16 +52,16 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 		context.Background(),
 		// Use the GCP resource detector to detect information about the GCP platform
 		resource.WithDetectors(gcp.NewDetector()),
-		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
-		resource.WithFromEnv(),
 		// Discover and provide information about the OpenTelemetry SDK used.
 		resource.WithTelemetrySDK(),
-		// Open Match attributes
+		// Default Open Match attributes (can be overridden via OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME)
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
 			semconv.ServiceNameKey.String("example"),
 			semconv.ServiceVersionKey.String("2.0.0"),
 		),
+		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
+		resource.WithFromEnv(),
 	)
 	if errors.Is(err, resource.ErrPartialResource) || errors.Is(err, resource.ErrSchemaURLConflict) {
 		otelLogger.Println(err) // Log non-fatal issues.
@@ -97,16 +97,16 @@ func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Con
 		context.Background(),
 		// Use the GCP resource detector to detect information about the GCP platform
 		resource.WithDetectors(gcp.NewDetector()),
-		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
-		resource.WithFromEnv(),
 		// Discover and provide information about the OpenTelemetry SDK used.
 		resource.WithTelemetrySDK(),
-		// Open Match attributes
+		// Default Open Match attributes (can be overridden via OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME)
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
 			semconv.ServiceNameKey.String("queue"),
 			semconv.ServiceVersionKey.String("2.0.0"),
 		),
+		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
+		resource.WithFromEnv(),
 	)
 	if errors.Is(err, resource.ErrPartialResource) || errors.Is(err, resource.ErrSchemaURLConflict) {
 		otelLogger.Println(err) // Log non-fatal issues.
