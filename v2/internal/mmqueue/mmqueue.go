@@ -107,15 +107,15 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	// one ticket for each incoming request.  Limit the number of concurrent
 	// creations by blocking until one of the MAX_CONCURRENT_TICKET_CREATIONS
 	// 'slots' is available.
+	// Don't exit the Run() function as long as this goroutine is running.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		cLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_creation",
 		})
 		cLogger.Debug("Processing queued ticket creation requests")
-
-		// Don't exit the Run() function as long as this goroutine is running.
-		wg.Add(1)
-		defer wg.Done()
 
 		// Loop forever
 		for {
@@ -157,22 +157,34 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	}()
 
 	// goroutine to activate pending tickets.
+	// Don't exit the Run() function as long as this goroutine is running.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		aLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_activation",
 		})
 		aLogger.Debug("activating created tickets")
-
-		// Don't exit the Run() function as long as this goroutine is running.
-		wg.Add(1)
-		defer wg.Done()
 
 		// Make a derived context with the activationType 'activate', which is used
 		// by the omclient to distinguish between logs for initial ticket activation
 		// and re-activation after a failed matching attempt.
 		ctx := context.WithValue(ctx, "activationType", "activate")
 
-		q.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
+		activationResults := make(chan omclient.ActivationResult, 1000)
+		go func() {
+			for res := range activationResults {
+				otelActivationsPerCall.Record(ctx, 1)
+				if res.Err != nil {
+					aLogger.WithField("ticket_id", res.TicketId).Errorf("Ticket activation failed: %v", res.Err)
+					otelTicketActivationFailures.Add(ctx, 1)
+				}
+			}
+		}()
+
+		q.OmClient.ActivateTicketsWithResults(ctx, ticketIdsToActivate, activationResults)
+		close(activationResults)
 	}()
 
 	// goroutine to process incoming assignments.
@@ -190,15 +202,15 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	// retreival into the part of your online services suite responsible for
 	// returning player online status, like a player online event bus or
 	// presence service.
+	// Don't exit the Run() function as long as this goroutine is running.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		bLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_assignment",
 		})
 		bLogger.Debug("processing incoming ticket assignments")
-
-		// Don't exit the Run() function as long as this goroutine is running.
-		wg.Add(1)
-		defer wg.Done()
 
 		var assigned sync.Map
 
@@ -302,10 +314,11 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 			var ticketCounterMutex sync.Mutex
 			durationRecorded := false
 			var dur time.Duration
+			tqCh := tq
 			for {
 				select {
 				// Read all the structs put into the channel by the tpc goroutine below.
-				case _, ok := <-tq:
+				case _, ok := <-tqCh:
 					if ok {
 						// There are still structs in the channel representing tickets we want
 						// created.
@@ -333,6 +346,7 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 						}()
 
 					} else {
+						tqCh = nil
 						if !durationRecorded {
 							// no more tickets to create this second, record how long elapsed
 							dur = time.Since(startTime)
@@ -374,16 +388,16 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 
 		// Simple tpc goroutine that puts one struct in the channel for every ticket
 		// we want to generate this second.
-		go func() {
+		go func(ch chan struct{}) {
 			// TPC can be updated at any time, so protect it with a mutex.
 			tpcMutex.Lock()
 			thisTPC := q.TPC
 			tpcMutex.Unlock()
 			for i := thisTPC; i > 0; i-- {
-				tq <- struct{}{}
+				ch <- struct{}{}
 			}
-			close(tq)
-		}()
+			close(ch)
+		}(tq)
 
 		// Wait for ticket creation goroutine to hit the 1 second deadline.
 		wg.Wait()

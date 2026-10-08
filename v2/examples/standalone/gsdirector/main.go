@@ -65,8 +65,13 @@ func main() {
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
 	cfg.SetDefault("PORT", "8090")
+	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
+	cfg.SetDefault("SOLODUEL_PORT", 50090)
 
-	// OM core config that the matchmaker needs to respect
+	// OM core config that the matchmaker needs to respect.
+	// Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL (default 500), which
+	// also bounds packed replication stream entries when
+	// OM_CACHE_PACK_TICKET_STATE_UPDATES=true.
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 
 	// InvokeMatchmaking Function config
@@ -75,10 +80,26 @@ func main() {
 	// development of matching logic, it is often useful to run a deterministic
 	// number of cycles.
 	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)
+	cfg.SetDefault("MM_CYCLE_MIN_DURATION_MS", 5000) // Director will sleep if the invokeMMFs didn't take at least this long.
 	// Exit if 3 matchmaking cycles come back empty. Again, you probably don't
 	// want to do this in production, but it can be very useful in local
 	// testing.
 	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32)
+
+	// When false (default), matches annotated by om-core with
+	// deactivation_timeout=true are still accepted (relying on the director's
+	// assignments map to catch any cross-cycle duplicate tickets and scaling
+	// up the next cycle sleep backoff). When true, annotated matches are
+	// immediately rejected and their tickets are sent for re-activation.
+	cfg.SetDefault("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", false)
+
+	// When false (default), backfill MmfRequests (ordered first by GetMMFParams)
+	// are kicked off first, and fleet MmfRequests are started immediately
+	// afterward in the same cycle so both see the same active player pool.
+	// When true, the director waits for each backfill MmfRequest stream to
+	// complete (and for om-core to deactivate its matched tickets) before
+	// starting subsequent MmfRequests.
+	cfg.SetDefault("WAIT_FOR_BACKFILL_MMFS", false)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -97,6 +118,7 @@ func main() {
 	// different assignment return data flow.  We sugest using a distributed
 	// message bus, pub/sub system, or your platform service's notification
 	// service when returning assignments.
+	cfg.SetDefault("ASSIGNMENT_TTL_MS", 1200000) // default 1200 secs = 20 mins
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "")
 	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
 	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
@@ -145,11 +167,7 @@ func main() {
 
 	// Initialize the director
 	d := &gsdirector.MockDirector{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{},
-			Log:    log,
-			Cfg:    cfg,
-		},
+		OmClient: omclient.New(cfg, log, &http.Client{}),
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log: log,
 		},
@@ -157,6 +175,17 @@ func main() {
 		Log:                 log,
 		AssignmentPublisher: publisher,
 		OtelMeterPtr:        meterptr,
+	}
+
+	// Apply configured MMF endpoint to the sample SoloDuel/HeroShooter game modes
+	// and re-serialize their backfill MmfRequest extensions before initializing GSManager.
+	gsdirector.Fifo.Host = cfg.GetString("SOLODUEL_ADDR")
+	gsdirector.Fifo.Port = cfg.GetInt32("SOLODUEL_PORT")
+	if err := gsdirector.SoloDuel.SetBackfillMMFs(gsdirector.Fifo); err != nil {
+		logger.Fatalf("Failed to configure SoloDuel backfill MMFs: %v", err)
+	}
+	if err := gsdirector.HeroShooter.SetBackfillMMFs(gsdirector.Fifo); err != nil {
+		logger.Fatalf("Failed to configure HeroShooter backfill MMFs: %v", err)
 	}
 
 	// In a real stand-alone director, you would read in your actual game server configuration and construct

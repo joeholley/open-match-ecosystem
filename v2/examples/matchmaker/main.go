@@ -92,19 +92,18 @@ var (
 		Extensions:              map[string]*anypb.Any{"testKey": testEx},
 	}
 
-	// The MMF request this type of game should use if the match is not filled.
-	backfillMMFs, _ = anypb.New(&pb.MmfRequest{Mmfs: []*pb.MatchmakingFunctionSpec{mmfFifo}})
 	// Define the parameters for a 'solo duel' (ffa) game mode.
+	// Note: Backfill MMF specs are serialized into soloduel.ExtensionParams via
+	// soloduel.SetBackfillMMFs(mmfFifo) in main() after SOLODUEL_ADDR and
+	// SOLODUEL_PORT have been populated from configuration.
 	soloduel = &gsdirector.GameMode{
 		Name:  "SoloDuel",
 		MMFs:  []*pb.MatchmakingFunctionSpec{mmfFifo, mmfDebug},
 		Pools: map[string]*pb.Pool{"all": everyTicketPool},
-		ExtensionParams: extensions.Combine(extensions.AnypbIntMap(map[string]int32{
+		ExtensionParams: extensions.AnypbIntMap(map[string]int32{
 			"desiredNumRosters": 1,
 			"desiredRosterLen":  4,
 			"minRosterLen":      2,
-		}), map[string]*anypb.Any{
-			extensions.MMFRequestKey: backfillMMFs,
 		}),
 	}
 	// Define which zones this game mode should be available in.
@@ -144,7 +143,10 @@ func main() {
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
 
-	// OM core config that the matchmaker needs to respect
+	// OM core config that the matchmaker needs to respect.
+	// Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL (default 500), which
+	// also bounds packed replication stream entries when
+	// OM_CACHE_PACK_TICKET_STATE_UPDATES=true.
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 
 	// Ticket creation config
@@ -163,6 +165,21 @@ func main() {
 
 	// Exit if consequative matchmaking cycles come back empty. Again, you probably don't want to do this in production, but it can be very useful in local testing.
 	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32)
+
+	// When false (default), matches annotated by om-core with
+	// deactivation_timeout=true are still accepted (relying on the director's
+	// assignments map to catch any cross-cycle duplicate tickets and scaling
+	// up the next cycle sleep backoff). When true, annotated matches are
+	// immediately rejected and their tickets are sent for re-activation.
+	cfg.SetDefault("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", false)
+
+	// When false (default), backfill MmfRequests (ordered first by GetMMFParams)
+	// are kicked off first, and fleet MmfRequests are started immediately
+	// afterward in the same cycle so both see the same active player pool.
+	// When true, the director waits for each backfill MmfRequest stream to
+	// complete (and for om-core to deactivate its matched tickets) before
+	// starting subsequent MmfRequests.
+	cfg.SetDefault("WAIT_FOR_BACKFILL_MMFS", false)
 
 	// MMF config
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
@@ -187,13 +204,14 @@ func main() {
 	// your platform service's notification service to return assignments
 	// instead.
 
-	// When using the deprecated om-core assignment endpoints, set this
-	// duration to slightly longer than your configured OM_CACHE_TICKET_TTL_MS
-	// and OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS config vars in om-core, added
-	// together. If you haven't manually set those config vars, you can see the
-	// default values in the om-core repository's 'internal/config/config.go'
-	// file.
-	cfg.SetDefault("ASSIGNMENT_TTL_MS", 1200000) // default 1200 secs = 10 mins
+	// How long the director remembers assigned ticket IDs in memory to guard
+	// against cross-cycle ticket collisions. Set this duration to slightly
+	// longer than your configured OM_CACHE_TICKET_TTL_MS (and the deprecated
+	// OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS, if using the deprecated om-core
+	// assignment endpoints) in om-core, added together. If you haven't
+	// manually set those config vars, you can see the default values in the
+	// om-core repository's 'internal/config/config.go' file.
+	cfg.SetDefault("ASSIGNMENT_TTL_MS", 1200000) // default 1200 secs = 20 mins
 
 	// Assignment distribution default config uses golang channels for this
 	// 'all-in-one' matchmaker, where the mmqueue and gsdirector are in the
@@ -257,19 +275,15 @@ func main() {
 
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{
-				Transport: &http.Transport{
-					MaxIdleConns:        100,              // Maximum idle connections to keep open
-					MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
-					IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
-					DisableKeepAlives:   false,            // Make sure keep-alives are enabled
-				},
-				Timeout: 30 * time.Second,
+		OmClient: omclient.New(cfg, log, &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,              // Maximum idle connections to keep open
+				MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+				IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+				DisableKeepAlives:   false,            // Make sure keep-alives are enabled
 			},
-			Log: log,
-			Cfg: cfg,
-		},
+			Timeout: 30 * time.Second,
+		}),
 		Cfg:                cfg,
 		Log:                log,
 		ClientRequestChan:  make(chan *mmqueue.ClientRequest),
@@ -279,11 +293,7 @@ func main() {
 
 	// Initialize the director
 	d := &gsdirector.MockDirector{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{},
-			Log:    log,
-			Cfg:    cfg,
-		},
+		OmClient: omclient.New(cfg, log, &http.Client{}),
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log:          log,
 			OtelMeterPtr: meterptr,
@@ -301,6 +311,9 @@ func main() {
 	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
 	mmfDebug.Host = cfg.GetString("DEBUGMMF_ADDR")
 	mmfDebug.Port = cfg.GetInt32("DEBUGMMF_PORT")
+	if err := soloduel.SetBackfillMMFs(mmfFifo); err != nil {
+		logger.Fatalf("Failed to configure SoloDuel backfill MMFs: %v", err)
+	}
 	if cfg.GetString("SOLODUEL_ADDR") == "http://localhost" {
 		localTestMMF := fifo.NewWithLogger(log)
 		go mmfserver.StartServer(cfg.GetInt32("SOLODUEL_PORT"), localTestMMF, log)

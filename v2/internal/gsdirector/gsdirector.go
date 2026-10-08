@@ -237,6 +237,23 @@ type GameMode struct {
 	ExtensionParams map[string]*anypb.Any
 }
 
+// SetBackfillMMFs marshals a pb.MmfRequest containing mmfs into
+// gm.ExtensionParams[ex.MMFRequestKey]. Because anypb.New serializes the
+// MatchmakingFunctionSpec messages immediately, call SetBackfillMMFs after all
+// MMF Host and Port fields have been populated from configuration and before
+// calling GSManager.Init().
+func (gm *GameMode) SetBackfillMMFs(mmfs ...*pb.MatchmakingFunctionSpec) error {
+	bf, err := anypb.New(&pb.MmfRequest{Mmfs: mmfs})
+	if err != nil {
+		return err
+	}
+	if gm.ExtensionParams == nil {
+		gm.ExtensionParams = make(map[string]*anypb.Any)
+	}
+	gm.ExtensionParams[ex.MMFRequestKey] = bf
+	return nil
+}
+
 // MockAgonesIntegration is an abstraction of the game server integration
 // module you would write for a real matchmaker. It mocks out quite a bit of
 // functionality that would, in a real system, require you to read data from
@@ -363,7 +380,9 @@ func (m *MockAgonesIntegration) updateGameServerMetadata(defunctAllocationSpecJS
 	// Decorative closure to make it easy to see what happens inside the mutex lock.
 	{
 		m.mutex.Lock()
-		update.gs.allocSpec = m.gameServers[defunctAllocationSpecJSON].server.allocSpec
+		if gsSet, ok := m.gameServers[defunctAllocationSpecJSON]; ok {
+			update.gs.allocSpec = gsSet.server.allocSpec
+		}
 		m.mutex.Unlock()
 	}
 
@@ -795,7 +814,14 @@ func (m *MockAgonesIntegration) Allocate(allocationSpecJSON string, match *pb.Ma
 	// would send to an Agones Game Server Informer after a successful
 	// Agones allocation operation.
 	aLogger.Debugf("Allocating server")
-	m.updateGameServerMetadata(allocationSpecJSON, []*pb.MmfRequest{})
+	nextMMFRequest := &pb.MmfRequest{}
+	hasBackfill := match.GetExtensions() != nil &&
+		match.GetExtensions()[ex.MMFRequestKey] != nil &&
+		match.GetExtensions()[ex.MMFRequestKey].UnmarshalTo(nextMMFRequest) == nil &&
+		nextMMFRequest.GetProfile().GetName() != ""
+	if !hasBackfill {
+		m.updateGameServerMetadata(allocationSpecJSON, []*pb.MmfRequest{})
+	}
 	// In a real implementation, you'd receive the agonesv1.GameServerStatus{}
 	// object from kubernetes/the Agones SDK.  Here we generate a mock one instead.
 	mockGameServerStatus := &agonesv1.GameServerStatus{
@@ -952,6 +978,39 @@ type MockDirector struct {
 	pendingMmfRequestsByHash map[string]*pb.MmfRequest
 }
 
+// hasDeactivationTimeout checks whether om-core annotated the match with
+// MatchDeactivationTimeoutKey (deactivation_timeout=true). Returns (false, nil)
+// when the match, its extensions map, or the key is absent.
+func hasDeactivationTimeout(match *pb.Match) (bool, error) {
+	timedOut, err := ex.Bool(match.GetExtensions(), ex.MatchDeactivationTimeoutKey)
+	if errors.Is(err, ex.NoSuchKeyError) {
+		return false, nil
+	}
+	return timedOut, err
+}
+
+// countMatchTickets returns the total number of tickets across all rosters in match.
+func countMatchTickets(match *pb.Match) int64 {
+	var total int64
+	for _, roster := range match.GetRosters() {
+		total += int64(len(roster.GetTickets()))
+	}
+	return total
+}
+
+// calculateCycleBackoffFactor returns the multiplier (>= 1.0) applied to
+// MM_CYCLE_MIN_DURATION_MS based on the fraction of proposed matches that
+// experienced either previously-assigned ticket collisions (lagging indicator)
+// or om-core deactivation_timeout annotations (leading indicator).
+// Guards against numProposed == 0 so empty cycles return 1.0 instead of NaN.
+func calculateCycleBackoffFactor(numProposed, numMatchesWithAssignedTickets, numMatchesWithDeactivationTimeout int64) float64 {
+	if numProposed == 0 {
+		return 1.0
+	}
+	laggingMatches := max(numMatchesWithAssignedTickets, numMatchesWithDeactivationTimeout)
+	return (float64(laggingMatches) / float64(numProposed)) + 1.0
+}
+
 // Run the MockDirector.
 //
 // This function is intended to be run for the lifetime of your matchmaker. It
@@ -982,6 +1041,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 	ticketIdsToActivate := make(chan string, 10000)
 	var startTime time.Time
 	var proposedMatches []*pb.Match
+	var proposedMatchesMu sync.Mutex
 	var matches map[*pb.Match]string
 
 	// Track assignments this director has made
@@ -1007,15 +1067,26 @@ func (d *MockDirector) Run(ctx context.Context) {
 		aLogger := logger.WithFields(logrus.Fields{"operation": "ticket_reactivation"})
 		aLogger.Trace("requesting re-activation of rejected tickets")
 
-		// request re-activation of rejected tickets.
+		// request re-activation of rejected tickets and record any permanent per-ticket failures.
 		atCtx := context.WithValue(ctx, "activationType", "re-activate")
-		d.OmClient.ActivateTickets(atCtx, ticketIdsToActivate)
+		reactivationResults := make(chan omclient.ActivationResult, 1000)
+		go func() {
+			for res := range reactivationResults {
+				if res.Err != nil {
+					aLogger.WithField("ticket_id", res.TicketId).Errorf("Ticket re-activation failed: %v", res.Err)
+					otelTicketReactivationFailures.Add(atCtx, 1)
+				}
+			}
+		}()
+		d.OmClient.ActivateTicketsWithResults(atCtx, ticketIdsToActivate, reactivationResults)
+		close(reactivationResults)
 	}()
 
 	// Kick off main matchmaking loop
 	// Loop for the configured number of cycles
 	lLogger := logger.WithFields(logrus.Fields{"operation": "matchmaking_loop"})
 	lLogger.Debugf("Beginning matchmaking cycle, %v cycles configured", d.Cfg.GetInt("NUM_MM_CYCLES"))
+	consecutiveEmptyCycles := 0
 	for i := d.Cfg.GetInt("NUM_MM_CYCLES"); i > 0; i-- { // Main Matchmaking Loop
 
 		// Loop var init
@@ -1028,6 +1099,8 @@ func (d *MockDirector) Run(ctx context.Context) {
 		numTicketAssignments := int64(0)
 		numRejectedMatches := int64(0)
 		numMatchesWithAssignedTickets := int64(0)
+		numMatchesWithDeactivationTimeout := int64(0)
+		numTicketsInDeactivationTimeoutMatches := int64(0)
 		numIdsToActivate := int64(0)
 		numTicketsRejected := int64(0)
 		numAssignedRejectedTickets := int64(0)
@@ -1047,16 +1120,15 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// about why this is useful, read the documentation on MMF design.
 		// open-match-ecosystem/v2/examples/mmf/README.md
 		//
-		// NOTE: OM won't take longer than its configured timeout to return
-		// matches (determined by the OM_MMF_TIMEOUT_SECS config var in
-		// your om-core deployment). The
-		// `rClient.InvokeMatchmakingFunctions()` will always return.
-		//
-		// TODO: make timeout configurable
-		// This uses context cancellation causes to help diagnose potential
-		// issues. See https://github.com/golang/go/issues/56661 for more info.
+		// NOTE: Do NOT attach a short client-side deadline here. om-core
+		// enforces OM_MMF_TIMEOUT_SECS and OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS
+		// server-side, so InvokeMatchmakingFunctions() is bounded. Cancelling the
+		// client context mid-stream is dangerous because om-core deactivates a
+		// match's tickets (and waits for local replication) *before* checking
+		// ctx.Err() when streaming the match back; cancelling early drops those
+		// matches after their tickets were already deactivated, stranding those
+		// players until OM_CACHE_TICKET_TTL_MS expires.
 		cycleCtx, cancel := context.WithCancelCause(ctx)
-		cycleCtx, _ = context.WithTimeoutCause(cycleCtx, time.Duration(d.Cfg.GetInt("MMF_TIMEOUT_SECS"))*time.Second, MMFTimeoutError)
 
 		// Make a channel-of-channels that contains the response channels for all the
 		// concurrent calls we'll make to OM.
@@ -1099,7 +1171,9 @@ func (d *MockDirector) Run(ctx context.Context) {
 							// be done asynchronously, like reading match metadata from
 							// the extensions field or constructing a ticket collision map
 							// to examine later, this is a good place to kick off that work.
+							proposedMatchesMu.Lock()
 							proposedMatches = append(proposedMatches, resPb.GetMatch())
+							proposedMatchesMu.Unlock()
 						} // end of else clause
 
 					} // end of loop over all matches on this individual channel.
@@ -1117,7 +1191,6 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// InvokeMmfs Example
 		requests := d.GSManager.GetMMFParams()
 		for _, reqPb := range requests {
-			wg.Add(1)
 			mmfLogFields := logrus.Fields{"operation": "mmfrequest"}
 
 			// Get the number of mmfs to be invoked by this request.
@@ -1150,7 +1223,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			//
 			// Retrieve pre-calculated hash from the request extensions instead
 			// of re-calculating it here.
-			mmfReqHash, err := ex.String(reqPb.Profile.GetExtensions(), ex.MMFRequestHashKey)
+			mmfReqHash, err := ex.String(reqPb.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
 			if err != nil {
 				rLogger.Errorf("Unable to retreive MmfRequest hash from profile extensions, discarding MmfRequest: %v", err)
 				continue
@@ -1160,12 +1233,26 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// Make a channel for responses from this MMF invocation.
 			invocationResultChan := make(chan *pb.StreamedMmfResponse)
 
+			// Increment WaitGroup only after validating the request, right before
+			// handing invocationResultChan to the fan-in reader goroutine.
+			wg.Add(1)
+
 			// Tell the fan-in goroutine to monitor this new channel for matches.
 			fanInChan <- invocationResultChan
 
 			// Invoke matchmaking functions, match results are sent back
 			// using the channel we just created.
-			go d.OmClient.InvokeMatchmakingFunctions(ctx, reqPb, invocationResultChan)
+			// By default (WAIT_FOR_BACKFILL_MMFS=false), backfill requests (sorted
+			// first by GetMMFParams) are kicked off first and fleet requests are
+			// started immediately afterward against the same player pool. When
+			// WAIT_FOR_BACKFILL_MMFS=true, the director waits for each backfill
+			// MmfRequest stream to finish (so om-core deactivates its matched
+			// tickets) before starting subsequent MmfRequests.
+			if d.Cfg.GetBool("WAIT_FOR_BACKFILL_MMFS") && strings.HasPrefix(reqPb.GetProfile().GetName(), "backfill.") {
+				d.OmClient.InvokeMatchmakingFunctions(cycleCtx, reqPb, invocationResultChan)
+			} else {
+				go d.OmClient.InvokeMatchmakingFunctions(cycleCtx, reqPb, invocationResultChan)
+			}
 
 			// Track metrics.
 			otelMMFsPerOMCall.Record(ctx, int64(numMMFs),
@@ -1183,6 +1270,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// the fanInChan so the asynchronous channel fan-in goroutine knows it can exit as
 		// no more match results are coming in this cycle.
 		close(fanInChan)
+		cancel(MMFComplete)
 
 		// Here's where we check each match to decide if we want to
 		// allocate a server for it, or reject it.  (In OM1.x, this
@@ -1194,25 +1282,40 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// - matches that outstrip our game server capacity, etc.
 		lLogger.Debugf("%v proposed matches to evaluate", len(proposedMatches))
 
+		// Prioritize backfill proposals ahead of standard fleet proposals (matching
+		// the priority order in GetMMFParams) when concurrent MMF streams fan in.
+		sort.SliceStable(proposedMatches, func(a, b int) bool {
+			profA, _ := ex.String(proposedMatches[a].GetExtensions(), "profileName")
+			profB, _ := ex.String(proposedMatches[b].GetExtensions(), "profileName")
+			return strings.HasPrefix(profA, "backfill.") && !strings.HasPrefix(profB, "backfill.")
+		})
+
+		acceptedInCycle := make(map[string]bool)
+
 		// Here is where you loop over all the returned match proposals and make decisions.
 		//
 		// Here's a simple local function to 'reject' a proposed match by adding all the
-		// tickets in it to the channel of ticket ids to reactivate in OM. Returns the number
-		// of tickets in the rejected match.
+		// unassigned tickets in it to the channel of ticket ids to reactivate in OM.
+		// Returns the number of tickets queued for re-activation.
 		rejectMatch := func(match *pb.Match) int64 {
-			numTicketsInMatch := int64(0)
+			numReactivated := int64(0)
 			numRejectedMatches++
 			for _, roster := range match.GetRosters() {
 				for _, ticket := range roster.GetTickets() {
+					tid := ticket.GetId()
+					// Never re-activate a ticket that has already been assigned to a game server.
+					if assignments[tid] || acceptedInCycle[tid] {
+						continue
+					}
 					// queue this ticket ID to be re-activated
-					d.Log.Tracef("sending ticketid %v for re-activation", ticket.GetId())
-					ticketIdsToActivate <- ticket.GetId()
+					d.Log.Tracef("sending ticketid %v for re-activation", tid)
+					ticketIdsToActivate <- tid
+					numReactivated++
+					numIdsToActivate++
 				}
-				numTicketsInMatch += int64(len(roster.GetTickets()))
-				numIdsToActivate += int64(len(roster.GetTickets()))
 				numTicketsRejected += int64(len(roster.GetTickets()))
 			}
-			return numTicketsInMatch
+			return numReactivated
 		}
 
 	ProposalsLoop:
@@ -1220,6 +1323,26 @@ func (d *MockDirector) Run(ctx context.Context) {
 			mLogger := lLogger.WithFields(logrus.Fields{
 				"match_id": match.Id,
 			})
+
+			// Check whether om-core annotated this match with deactivation_timeout=true
+			// (indicating that om-core could not confirm local cache replication of the
+			// match's ticket deactivations within OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS,
+			// or that all deactivation writes for the match failed to yield a replication ID).
+			// We check this before the random test rejection so metrics reflect what om-core returned.
+			timedOut, err := hasDeactivationTimeout(match)
+			if err != nil {
+				mLogger.Errorf("Malformed %v extension on match: %v", ex.MatchDeactivationTimeoutKey, err)
+			} else if timedOut {
+				numMatchesWithDeactivationTimeout++
+				numTicketsInDeactivationTimeoutMatches += countMatchTickets(match)
+				mLogger.Warn("om-core could not confirm local deactivation of this match's tickets before returning it (deactivation_timeout=true); next-cycle ticket collision risk is elevated")
+				if d.Cfg.GetBool("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT") {
+					numRejectedTickets := rejectMatch(match)
+					mLogger.Warnf("Rejecting match due to deactivation_timeout, %v tickets will be sent for re-activation", numRejectedTickets)
+					continue ProposalsLoop
+				}
+			}
+
 			// Common decision points:
 			//  - if multiple matches have the same ticket ('ticket
 			//  collision'), which is used? What happens to the unused matches?
@@ -1280,10 +1403,13 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// Check if this match contains any ticket IDs we've previously assigned, and
 			// if so, reject it.
 			numAssigned := int64(0)
+			numSameCycleOverlap := int64(0)
 			for _, roster := range match.GetRosters() {
 				for _, ticket := range roster.GetTickets() {
 					if _, previouslyAssigned := assignments[ticket.GetId()]; previouslyAssigned {
 						numAssigned++
+					} else if acceptedInCycle[ticket.GetId()] {
+						numSameCycleOverlap++
 					}
 				}
 			}
@@ -1296,6 +1422,11 @@ func (d *MockDirector) Run(ctx context.Context) {
 				numMatchesWithAssignedTickets++
 				numRejectedTicketsInMatchesWithAssignedTickets += numRejectedTickets
 				numAssignedRejectedTickets += numAssigned
+				continue ProposalsLoop
+			}
+			if numSameCycleOverlap > 0 {
+				numRejectedTickets := rejectMatch(match)
+				mLogger.Debugf("Rejecting match containing %v tickets already accepted by a higher-priority proposal in this cycle, %v tickets will be sent for re-activation", numSameCycleOverlap, numRejectedTickets)
 				continue ProposalsLoop
 			}
 
@@ -1314,23 +1445,38 @@ func (d *MockDirector) Run(ctx context.Context) {
 				newMMFRequestsProcessed++
 			}
 
+			for _, roster := range match.GetRosters() {
+				for _, ticket := range roster.GetTickets() {
+					acceptedInCycle[ticket.GetId()] = true
+				}
+			}
+
 			// This proposed match passed all our decision points and validation checks,
 			// lets add it to the map of matches we want to allocate a server for.
 			//acceptedMatchesCounter.Add(ctx, 1)
 			matches[match] = allocatorSpec
 		}
 
-		// log if some matches were rejected because they contained tickets
-		// that the director already assigned. If this happens once in a while,
-		// that's fine - there could have been a momentary processing latency
-		// spike that caused om-core to not have finished deactivating all the
-		// tickets from previous InvokeMMFs calls before we made another one.
-		// As long as it's rare and intermittant, it's nothing to worry about.
-		// However, if it is happening regularly, then you either 1) need to
-		// scale out om-core so it isn't under so much load or 2) have reached
-		// the scaling limit of om-core's current backing state storage
-		// replication configuration (i.e. Redis is the bottleneck) and need
-		// to look into using more read replicas.
+		// Log per-cycle replication lag / collision warnings:
+		// 1) Leading indicator: om-core annotated returned matches with
+		//    `deactivation_timeout=true` because waiting for their ticket
+		//    deactivations to replicate to om-core's local cache exceeded
+		//    OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS (or deactivation writes
+		//    failed to produce a replication ID). Pair this with om-core metrics
+		//    `om_core.mmf.deactivation.timeouts`, `om_core.cache.replication.lag`,
+		//    and `om_core.cache.incoming.backlog`.
+		// 2) Lagging indicator: matches were rejected because they contained
+		//    tickets that the director already assigned in an earlier cycle.
+		//
+		// Occasional occurrences during a latency spike are benign, but if either
+		// happens regularly you should:
+		// - scale out om-core or add Redis read replicas if replication is saturated,
+		// - tune OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS or MM_CYCLE_MIN_DURATION_MS, or
+		// - enable OM_CACHE_PACK_TICKET_STATE_UPDATES=true once all om-core instances
+		//   in your deployment have been upgraded to support packed stream entries.
+		if numMatchesWithDeactivationTimeout > 0 {
+			d.Log.Warnf("%v proposed matches (%v tickets) had deactivation_timeout set by om-core", numMatchesWithDeactivationTimeout, numTicketsInDeactivationTimeoutMatches)
+		}
 		if numAssignedRejectedTickets > 0 {
 			d.Log.Warnf("%v previously assigned ticketIds were found in proposed matches, resulting in a total of %v tickets being re-activated", numAssignedRejectedTickets, numRejectedTicketsInMatchesWithAssignedTickets)
 		}
@@ -1351,6 +1497,11 @@ func (d *MockDirector) Run(ctx context.Context) {
 				// No valid connection string returned from the game server
 				// manager, there must be an issue. Put these tickets back into the
 				// matchmaking pool.
+				for _, roster := range match.GetRosters() {
+					for _, ticket := range roster.GetTickets() {
+						delete(acceptedInCycle, ticket.GetId())
+					}
+				}
 				rejectMatch(match)
 			} else {
 				d.Log.Tracef("Match session assigned to game server %v", connString)
@@ -1444,21 +1595,32 @@ func (d *MockDirector) Run(ctx context.Context) {
 		}
 
 		// Calculate length of time to sleep before next loop.
-		// We recommend this is >= your configured OM_CACHE_IN_WAIT_TIMEOUT_MS
+		// We recommend setting MM_CYCLE_MIN_DURATION_MS >= your observed p99
+		// `om_core.cache.replication.lag` (whose idle floor is governed by
+		// OM_CACHE_IN_POLL_WAIT_MS / OM_CACHE_IN_FULL_POLL_WAIT_MS /
+		// OM_CACHE_IN_WAIT_TIMEOUT_MS and
+		// OM_CACHE_IN_SLEEP_BETWEEN_APPLYING_UPDATES_MS in om-core).
 		//
-		// Best practice is to wait a while before invoking MMFs again, to
-		// allow ticket re-activations to complete. If you're getting too many
-		// rejected matches because they contain tickets that have already been
-		// assigned to game servers, increase this length gradually until
-		// you've reached a number of rejected matches you're comfortable with.
-		// Bear in mind that this length directly correlates to how long
-		// players will have to wait to receive a match.
+		// Notice the asymmetry between deactivation and re-activation replication:
+		// - Slow *deactivation* replication risks next-cycle ticket collisions;
+		//   om-core guards against this by waiting up to
+		//   OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS and setting `deactivation_timeout`
+		//   on matches whose deactivations were not confirmed locally in time.
+		// - Slow *re-activation* replication only delays rejected tickets from
+		//   re-entering pools by one cycle.
 		//
-		// TODO: comment this after settling on an implementation
-		assignedBackoffFactor := (float64(numMatchesWithAssignedTickets) / float64(len(proposedMatches))) + 1.0
+		// When either previously-assigned ticket collisions or `deactivation_timeout`
+		// annotations occur, `assignedBackoffFactor` scales the minimum cycle duration
+		// up (up to 2x) to give om-core's local cache replication time to catch up.
+		assignedBackoffFactor := calculateCycleBackoffFactor(
+			int64(len(proposedMatches)),
+			numMatchesWithAssignedTickets,
+			numMatchesWithDeactivationTimeout,
+		)
 		minCycleDur := time.Millisecond * time.Duration(int64(d.Cfg.GetFloat64("MM_CYCLE_MIN_DURATION_MS")*assignedBackoffFactor))
 		sleepDur := time.Until(startTime.Add(minCycleDur))
 		dur := time.Since(startTime)
+		totalCycleDur := max(dur, minCycleDur)
 
 		// Record Open Telemetry metrics for this cycle
 		otelTicketsRejectedPerCycle.Record(ctx, numTicketsRejected)
@@ -1468,8 +1630,10 @@ func (d *MockDirector) Run(ctx context.Context) {
 		otelNewMMFRequestsProcessedPerCycle.Record(ctx, newMMFRequestsProcessed)
 		otelMatchesRejectedPerCycle.Record(ctx, numRejectedMatches)
 		otelMatchesWithAssignedTicketsPerCycle.Record(ctx, numMatchesWithAssignedTickets)
+		otelMatchesWithDeactivationTimeoutPerCycle.Record(ctx, numMatchesWithDeactivationTimeout)
+		otelTicketsInDeactivationTimeoutMatchesPerCycle.Record(ctx, numTicketsInDeactivationTimeoutMatches)
 		otelMatchesProposedPerCycle.Record(ctx, int64(len(proposedMatches)))
-		otelMatchmakingCycleDuration.Record(ctx, float64(dur.Microseconds()/1000))
+		otelMatchmakingCycleDuration.Record(ctx, float64(totalCycleDur.Microseconds())/1000.0)
 
 		// Status update closure. This is currently just for development
 		// debugging and may be removed or made into a separate function in
@@ -1478,17 +1642,26 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// Write the status of this cycle to the logger.
 			next := ", starting next cycle"
 			if sleepDur > 0 {
-				next = fmt.Sprintf(", next cycle starts in %.2fs (backoff factor: %0.1f", float64(sleepDur.Milliseconds())/1000.0, assignedBackoffFactor)
+				next = fmt.Sprintf(", next cycle starts in %.2fs (backoff factor: %0.1f)", float64(sleepDur.Milliseconds())/1000.0, assignedBackoffFactor)
 			}
-			cycleStatus := fmt.Sprintf("director mmf invocation cycle %010d/%010d: matches received %05d/%05d (%03.1f%% accepted/proposed),  time elapsed %.2f/%.2f (%03.1f%%) seconds  %v",
+			acceptedPct := 0.0
+			if len(proposedMatches) > 0 {
+				acceptedPct = float64(len(matches)) / float64(len(proposedMatches)) * 100.0
+			}
+			elapsedPct := 0.0
+			if minCycleDur.Milliseconds() > 0 {
+				elapsedPct = float64(dur.Milliseconds()) / float64(minCycleDur.Milliseconds()) * 100.0
+			}
+			cycleStatus := fmt.Sprintf("director mmf invocation cycle %010d/%010d: matches received %05d/%05d (%03.1f%% accepted/proposed, %05d deactivation_timeout),  time elapsed %.2f/%.2f (%03.1f%%) seconds  %v",
 				d.Cfg.GetInt("NUM_MM_CYCLES")+1-i,
 				d.Cfg.GetInt("NUM_MM_CYCLES")+1,
 				len(matches),
 				len(proposedMatches),
-				float64(len(matches))/float64(len(proposedMatches))*100.0,
+				acceptedPct,
+				numMatchesWithDeactivationTimeout,
 				float64(dur.Milliseconds())/1000.0,
 				float64(minCycleDur.Milliseconds())/1000.0,
-				float64(dur.Milliseconds())/float64(minCycleDur.Milliseconds())*100.0,
+				elapsedPct,
 				next,
 			)
 
@@ -1496,10 +1669,21 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 		}
 
-		// Sleep the calculated time.
-		time.Sleep(sleepDur)
+		// Exit early if we have reached the configured number of consecutive
+		// matchmaking cycles with zero proposed matches.
+		if len(proposedMatches) == 0 {
+			consecutiveEmptyCycles++
+		} else {
+			consecutiveEmptyCycles = 0
+		}
+		if maxEmpty := d.Cfg.GetInt("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT"); maxEmpty > 0 && consecutiveEmptyCycles >= maxEmpty {
+			lLogger.Infof("Reached %v consecutive empty matchmaking cycles (NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=%v), exiting matchmaking loop", consecutiveEmptyCycles, maxEmpty)
+			break
+		}
 
-		// Release resources associated with this context.
-		cancel(MMFComplete)
+		// Sleep the calculated time.
+		if sleepDur > 0 {
+			time.Sleep(sleepDur)
+		}
 	} // end of main matchmaking loop
 }

@@ -30,6 +30,7 @@ var (
 	// Metric variable declarations are global, so they can be accessed directly in the application code.
 	// Metrics populated by the grpc function implementations in main.go.
 	otelTicketAssignments                 otelmetrics.Int64Counter
+	otelTicketActivationFailures          otelmetrics.Int64Counter
 	otelTicketCreationRetries             otelmetrics.Int64Counter
 	otelTicketCreations                   otelmetrics.Int64Counter
 	otelTicketDeletionFailures            otelmetrics.Int64Counter
@@ -66,6 +67,14 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	otelActivationsPerCall, err = meter.Int64Histogram(
 		metricsNamePrefix+"ticket.activation.requests",
 		otelmetrics.WithDescription("Total tickets set to active, so they appear in pools"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelTicketActivationFailures, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.activations.failures",
+		otelmetrics.WithDescription("Total number of ticket activations that permanently failed"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

@@ -172,11 +172,7 @@ func main() {
 
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{},
-			Log:    log,
-			Cfg:    cfg,
-		},
+		OmClient:           omclient.New(cfg, log, &http.Client{}),
 		Cfg:                cfg,
 		Log:                log,
 		ClientRequestChan:  make(chan *mmqueue.ClientRequest),

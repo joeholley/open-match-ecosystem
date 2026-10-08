@@ -29,17 +29,20 @@ var (
 
 	// Metric variable declarations are global, so they can be accessed directly in the application code.
 	// Metrics populated by the grpc function implementations in main.go.
-	otelMMFResponseFailures                otelmetrics.Int64Counter
-	otelTicketsRejectedPerCycle            otelmetrics.Int64Histogram
-	otelAssignedTicketsInMatchesPerCycle   otelmetrics.Int64Histogram
-	otelTicketActivationsPerCycle          otelmetrics.Int64Histogram
-	otelTicketAssignmentsPerCycle          otelmetrics.Int64Histogram
-	otelNewMMFRequestsProcessedPerCycle    otelmetrics.Int64Histogram
-	otelMatchesRejectedPerCycle            otelmetrics.Int64Histogram
-	otelMatchesWithAssignedTicketsPerCycle otelmetrics.Int64Histogram
-	otelMatchesProposedPerCycle            otelmetrics.Int64Histogram
-	otelMMFsPerOMCall                      otelmetrics.Int64Histogram
-	otelMatchmakingCycleDuration           otelmetrics.Float64Histogram
+	otelMMFResponseFailures                         otelmetrics.Int64Counter
+	otelTicketReactivationFailures                  otelmetrics.Int64Counter
+	otelTicketsRejectedPerCycle                     otelmetrics.Int64Histogram
+	otelAssignedTicketsInMatchesPerCycle            otelmetrics.Int64Histogram
+	otelTicketActivationsPerCycle                   otelmetrics.Int64Histogram
+	otelTicketAssignmentsPerCycle                   otelmetrics.Int64Histogram
+	otelNewMMFRequestsProcessedPerCycle             otelmetrics.Int64Histogram
+	otelMatchesRejectedPerCycle                     otelmetrics.Int64Histogram
+	otelMatchesWithAssignedTicketsPerCycle          otelmetrics.Int64Histogram
+	otelMatchesWithDeactivationTimeoutPerCycle      otelmetrics.Int64Histogram
+	otelTicketsInDeactivationTimeoutMatchesPerCycle otelmetrics.Int64Histogram
+	otelMatchesProposedPerCycle                     otelmetrics.Int64Histogram
+	otelMMFsPerOMCall                               otelmetrics.Int64Histogram
+	otelMatchmakingCycleDuration                    otelmetrics.Float64Histogram
 )
 
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
@@ -51,6 +54,14 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	otelMMFResponseFailures, err = meter.Int64Counter(
 		metricsNamePrefix+"mmf.reponse.failures",
 		otelmetrics.WithDescription("Total MMF response stream errors"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelTicketReactivationFailures, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.reactivations.failures",
+		otelmetrics.WithDescription("Total number of ticket re-activations that permanently failed"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -107,6 +118,22 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	otelMatchesWithAssignedTicketsPerCycle, err = meter.Int64Histogram(
 		metricsNamePrefix+"matchmaking_cycle.match.rejections.assigned",
 		otelmetrics.WithDescription("Number of proposed matches among those rejected per cycle which contained one or more previously assigned tickets"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelMatchesWithDeactivationTimeoutPerCycle, err = meter.Int64Histogram(
+		metricsNamePrefix+"matchmaking_cycle.match.deactivation_timeouts",
+		otelmetrics.WithDescription("Number of proposed matches returned by om-core per cycle with the deactivation_timeout extension set"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelTicketsInDeactivationTimeoutMatchesPerCycle, err = meter.Int64Histogram(
+		metricsNamePrefix+"matchmaking_cycle.ticket.deactivation_timeouts",
+		otelmetrics.WithDescription("Number of tickets in proposed matches returned by om-core per cycle with the deactivation_timeout extension set"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
