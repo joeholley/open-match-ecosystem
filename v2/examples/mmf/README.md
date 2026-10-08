@@ -8,7 +8,9 @@ The only language requirement for any MMF is to implement the `MatchmakingFuncti
 
 For more details on which languages are supported by `protoc` and how to get started, you can visit the official Protocol Buffers documentation on [Supported Languages](https://protobuf.dev/reference/other/).
 
-This Open Match 2 sample MMF is intended as a starting point for your development of custom matching logic. This repository tries to make getting started with an MMF in Go as easy as possible by putting all the boilerplate code required to set up and start the gRPC service into reusable `main.go` and `server/server.go` source files. As a result, most developers will only have to adapt the matching logic in the `functions/soloduel/soloduel.go:Run()` function to suit their game's needs.
+This Open Match 2 sample MMF is intended as a starting point for your development of custom matching logic. This repository tries to make getting started with an MMF in Go as easy as possible by putting all the boilerplate code required to set up and start the gRPC service into reusable `main.go` and `server/server.go` source files. As a result, most developers will only have to adapt the matching logic in the `functions/fifo/fifo.go:Run()` function to suit their game's needs.
+
+By default, `examples/mmf` runs the `fifo` matchmaking function (`MMF_FUNCTION=fifo`). You can also set `MMF_FUNCTION=debug` via environment variable to run the `debug` profile-inspection MMF (`functions/debug/debug.go`) from the same container image.
 
 The sample is a golang application designed to be built using [CNCF Buildpacks](https://www.cncf.io/projects/buildpacks/), and our primary build process specifically uses [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview).
 
@@ -26,6 +28,8 @@ image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get
 ```
 
 There is no `cloudbuild.yaml` or `Dockerfile` provided. [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) takes care of everything without those files.
+
+When deploying a built MMF container image to Google Cloud Run, pass `--use-http2` so Cloud Run enables end-to-end HTTP/2 for gRPC streaming (and optionally set `--update-env-vars="MMF_FUNCTION=fifo"` or `"MMF_FUNCTION=debug"`).
 
 This application can also be built with the [`pack`](https://buildpacks.io/docs/for-platform-operators/how-to/integrate-ci/pack/) or [`docker`](https://www.docker.com/) CLIs with a little effort.
 
@@ -47,10 +51,13 @@ A typical approach is to consider your matching logic in your MMF as a matching 
 By convention:
 
 * Regarding extension fields, MMFs SHOULD:
-  * copy all extensions in the received profile over to the extensions of each outgoing match.
+  * copy all extensions in the received profile over to the extensions of each outgoing match. MMFs **SHOULD** clone the incoming `Profile.Extensions` map (e.g., using `maps.Clone(req.GetExtensions())` in Go) when initializing each outgoing `Match.Extensions` map rather than assigning `req.GetExtensions()` directly, so per-match extensions (`mmfName`, `profileName`, `score`, `deactivation_timeout`) do not alias across multiple matches created in the same invocation.
   * create and populate an extension field holding the name of the Profile used to make the match. The key for this field should be `profileName`. 
   * create and populate an extension field holding the name of the MMF used to make the match. The key for this field should be `mmfName`. 
   * create and populate an extension field containing the MMF's subjective evaluation of the match quality. The key for this field should be `score`. (See the below section "MMF considerations & common misconceptions" for more details.)
+  * **MUST NOT** populate the `deactivation_timeout` extension key on outgoing `Match` messages. That key is reserved for `om-core` to signal that local deactivation replication was not confirmed before the match was returned.
+* Regarding match rosters and ticket IDs:
+  * MMFs **MUST** only place valid ticket IDs received in the `Profile` pools into match rosters. `om-core` validates roster ticket IDs against the state storage ID format and skips invalid IDs during ticket deactivation (while still returning the match), and skips deactivation entirely for matches containing zero valid tickets (such as the empty match returned by the default `debug` MMF).
 * When generating a match ID string, MMFs SHOULD use [reverse-DNS notation](https://en.wikipedia.org/wiki/Reverse_domain_name_notation) by convention. Put any frequently changing portions of the match ID (timestamps, match counter, etc) between the last dot and the end of the ID string. This is to allow for recording a match ID as a metric attribute - everything after the last dot can be truncated and metrics can then still be meaningfully aggregated per MMF across multiple invocations by multiple profiles. For more information, Google 'high cardinality metrics'.  See how the example does it [here](https://github.com/googleforgames/open-match-ecosystem/blob/a215e8590b4eb8d64b81e50290e9a3daff8868ac/v2/examples/mmf/functions/fifo/fifo.go#L163).
 
 ## MMF considerations & common misconceptions

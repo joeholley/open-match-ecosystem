@@ -20,11 +20,14 @@ substitutions:
   _JOB_NAME: matchmaker-example 
   _SERVICE_ACCOUNT: matchmaker-example-identity
   _RUN_REGION: us-central1
+  _OTEL_SIDECAR_IMAGE: us-docker.pkg.dev/open-match-public-images/open-match2/otel-collector-sidecar
 
    # Application environment vars
   _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
   _SOLODUEL_ADDR: SOLODUEL_CLOUD_RUN_URL
   _SOLODUEL_PORT: "443"
+  _DEBUGMMF_ADDR: DEBUGMMF_CLOUD_RUN_URL
+  _DEBUGMMF_PORT: "443"
   _LOGGING_LEVEL: info 
 steps:
      
@@ -42,6 +45,12 @@ steps:
       - ${_SERVICE_ACCOUNT}
       - --region
       - ${_RUN_REGION}
+      # The example matchmaker runs continuous background matchmaking loops
+      # (mmqueue.Run and gsdirector.Run) with in-memory ticket/assignment state,
+      # so it should run as an always-on, non-throttled singleton by default.
+      - --no-cpu-throttling
+      - --min-instances=1
+      - --max-instances=1
 
       # Network config
       - --network
@@ -55,7 +64,15 @@ steps:
       - --ingress
       - all
 
-      # container config
+      # sidecar 'otel-collector' config
+      - --container
+      - "opentelemetry-collector"
+      - --image
+      - '${_OTEL_SIDECAR_IMAGE}'
+
+      # 'matchmaker' container config
+      - --container
+      - "matchmaker"
       - --image
       - '${_ARTIFACT_REGISTRY_URI}/${_JOB_NAME}:${COMMIT_SHA}'
       - --port
@@ -63,7 +80,7 @@ steps:
       - --memory
       - 1024Mi
 
-      # env vars
+      # env vars for 'matchmaker'
       - --update-env-vars
       - "OM_CORE_ADDR=${_OM_CORE_ADDR}"
       - --update-env-vars
@@ -71,4 +88,20 @@ steps:
       - --update-env-vars
       - "SOLODUEL_PORT=${_SOLODUEL_PORT}"
       - --update-env-vars
+      - "DEBUGMMF_ADDR=${_DEBUGMMF_ADDR}"
+      - --update-env-vars
+      - "DEBUGMMF_PORT=${_DEBUGMMF_PORT}"
+      - --update-env-vars
       - "LOGGING_LEVEL=${_LOGGING_LEVEL}"
+      # Default false: accept matches annotated with deactivation_timeout, warn, and increase cycle backoff; set true to reject and re-activate instead.
+      # - --update-env-vars
+      # - "REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false"
+      # Default 5000 (ms): minimum cycle duration; keep >= p99 om_core.cache.replication.lag so ticket state updates replicate between cycles.
+      # - --update-env-vars
+      # - "MM_CYCLE_MIN_DURATION_MS=5000"
+      # Default 500: max ticket IDs per ActivateTickets call; must be <= om-core OM_MAX_STATE_UPDATES_PER_CALL.
+      # - --update-env-vars
+      # - "OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500"
+      # Default false: kick off backfill MmfRequests first and start fleet MmfRequests immediately afterward; set true to wait for backfill MmfRequests to finish first.
+      # - --update-env-vars
+      # - "WAIT_FOR_BACKFILL_MMFS=false"

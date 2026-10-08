@@ -24,6 +24,18 @@ spec:
           value: "http://soloduel-service.default.svc.cluster.local"
         - name: SOLODUEL_PORT
           value: "80"
+        # Default false: accept matches annotated with deactivation_timeout, warn, and increase cycle backoff; set true to reject and re-activate instead.
+        # - name: REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT
+        #   value: "false"
+        # Default 5000 (ms): minimum cycle duration; keep >= p99 om_core.cache.replication.lag so ticket state updates replicate between cycles.
+        # - name: MM_CYCLE_MIN_DURATION_MS
+        #   value: "5000"
+        # Default 500: max ticket IDs per ActivateTickets call; must be <= om-core OM_MAX_STATE_UPDATES_PER_CALL.
+        # - name: OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL
+        #   value: "500"
+        # Default false: kick off backfill MmfRequests first and start fleet MmfRequests immediately afterward; set true to wait for backfill MmfRequests to finish first.
+        # - name: WAIT_FOR_BACKFILL_MMFS
+        #   value: "false"
 ---
 apiVersion: v1
 kind: Service

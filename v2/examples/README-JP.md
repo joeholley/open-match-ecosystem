@@ -99,3 +99,30 @@ Open Match 2は複数のMMFを並行して実行できるため、同じTicket�
   * 衝突するチケットを含むマッチ提案全体は、直ちに**拒否**されます。  
   * 拒否されたマッチのすべてのチケットは、ActivateTickets APIを介して再有効化のためにom-coreに送り返されます。これにより、（既に割り当てられたプレイヤーを除く）それらのプレイヤーは次のマッチメイキングサイクルで再び利用可能になります。この単純な「先着順」アプローチにより、一度プレイヤーが割り当てられると、別のマッチに配置されることはありません。
 
+##### **`om-core`によるサイクル間衝突の軽減と、レプリケーション遅延・MMF重複の見分け方**
+
+チケット衝突が発生した原因を正確に把握するには、**サイクル間のレプリケーション遅延**と**同一サイクル内のMMF重複**を区別する必要があります：
+
+1. **`om-core`がサイクル間の衝突を軽減する仕組み**: MMFが`Match`を返すと、`om-core`はそのマッチのroster内のすべてのチケットIDを検証し、状態ストレージのレプリケーションストリームに非アクティブ化（deactivation）更新を書き込みます。そしてデフォルト（`OM_MATCH_TICKET_DEACTIVATION_WAIT=true`）では、マッチをDirectorへストリームで返す前に、その非アクティブ化がローカルのチケットキャッシュへレプリケートされるまで最大`OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`（デフォルト`60000`ミリ秒）待機します。これにより、通常の状態では、返されたマッチ内のチケットは次のマッチメイキングサイクルが開始される前にローカルキャッシュ上で既に非アクティブとしてマークされています。
+2. **`deactivation_timeout`マッチ拡張フィールド**: ローカルキャッシュへのレプリケーション待機がタイムアウトした場合（またはマッチのすべてのチケット非アクティブ化書き込みがレプリケーションIDの生成に失敗した場合）、`om-core`は`om_core.mmf.deactivation.timeouts`をインクリメントし、返される`Match`に`extensions["deactivation_timeout"] = true`（`google.protobuf.BoolValue`、定数`extensions.MatchDeactivationTimeoutKey`）を設定します。
+   * デフォルト（`REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false`）では、`gsdirector`はそのマッチを**承認**します（多くの場合、Redisへの非アクティブ化書き込み自体は成功しておりローカルキャッシュへの適用だけが遅れているためであり、サイクル間の重複は引き続き`assignments`マップで防止されるためです）。同時に警告ログを出力し、`gsdirector.matchmaking_cycle.match.deactivation_timeouts`（および`gsdirector.matchmaking_cycle.ticket.deactivation_timeouts`）を記録したうえで、次のサイクルのスリープバックオフ（`assignedBackoffFactor`）を増加させて`om-core`のレプリケーションが追いつく時間を与えます。
+   * `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=true`を設定すると、`gsdirector`は`deactivation_timeout`が付与されたマッチを即座に拒否し、`ActivateTickets`を介してそれらのチケットを再有効化します。
+3. **レプリケーション遅延と同一サイクル内のMMF重複の区別**: `om-core`は`InvokeMatchmakingFunctions`呼び出しごとにアクティブなチケットのポイントインタイム・スナップショットを取得するため、その呼び出し内で起動されたすべてのMMFは全く同じアクティブプールを参照します。したがって、重複するプールを共有する2つの並行MMF（または同一のDirectorサイクル内で並列に発行された複数の`InvokeMatchmakingFunctions`呼び出し）は、単一サイクル内で同じチケットを含むマッチを正当に提案する可能性があります。
+   * 現在の`gsdirector`サンプルでは、`assignments`マップは`ProposalsLoop`が完了した**後**のゲームサーバー割り当てループ中に更新される点に注意してください。つまり、`assignments`マップは**過去のサイクル**で割り当てられたチケットとの衝突は検出しますが、**同一サイクル内**で承認された複数の提案間にまたがるチケットの重複は排除しません。本番環境で重複するプールを持つ複数のMMFを同一サイクル内で呼び出すDirectorを実装する場合は、同一サイクル内で承認される提案間でもチケットの重複排除を行う必要があります（例えば、候補となる提案をまず`score`順でソートし、ゲームサーバーを割り当てる前にサイクル単位の獲得済みチケットセットを追跡するなど）。
+4. **メトリクスのペアリングと対処方法**: マッチメーカー側（`gsdirector.*` / `mmqueue.*`）のメトリクスと`om-core`側（`om_core.*`）のメトリクスを組み合わせて監視することで、チケット衝突やサイクル時間の増加がレプリケーション遅延によるものかMMFの重複によるものかを診断できます：
+
+| v2メトリクスの兆候 | ペアで確認すべき`om-core`メトリクス | 解釈 |
+|---|---|---|
+| `gsdirector.matchmaking_cycle.match.deactivation_timeouts` ↑ | `om_core.mmf.deactivation.timeouts`, `om_core.mmf.deactivation.wait` p99, `om_core.cache.replication.lag` | 非アクティブ化が時間内にローカルキャッシュへ適用されていません。Redis/ストリームのバックログが増加しているか、`OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`が小さすぎます。 |
+| `gsdirector.matchmaking_cycle.match.rejections.assigned` ↑（timeouts = 0） | `om_core.mmf.prep.duration`, MMF重複（`profile.name`属性） | 非アクティブ化のレプリケーション遅延ではありません。プールの重複／同一サイクル内のMMF重複、または`MM_CYCLE_MIN_DURATION_MS`が*再有効化*のレプリケーション遅延より短いことが原因です。 |
+| `gsdirector.matchmaking_cycle.duration` ↑ | `om_core.mmf.deactivation.wait`, `om_core.cache.incoming.backlog`, `om_core.cache.incoming.apply.duration` | 受信レプリケーションが追いつくまでの`om-core`の非アクティブ化待機時間がマッチメイキングサイクル時間に含まれています。 |
+| `mmqueue.ticket.activations.failures` / `gsdirector.ticket.reactivations.failures` > 0 | `om_core.cache.outgoing.backlog`, `om_core.cache.outgoing.send.duration` | 送信レプリケーション経路が飽和しているか、無効なチケットIDが（再）有効化されています。 |
+| TPCに対するスループットの頭打ち | `om_core.cache.outgoing.updates`, `om_core.cache.incoming.polls.full` | `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`の有効化を検討すべきケースです（すべての`om-core`インスタンスのアップグレード後のみ）。 |
+
+   * **対処方法**: `om_core.cache.replication.lag`や`om_core.mmf.deactivation.timeouts`が増加している場合は、`MM_CYCLE_MIN_DURATION_MS`を`om_core.cache.replication.lag`のp99以上に調整する、1サイクルあたりのMMFファンアウトを減らす、`om-core`やRedisをスケールさせる、または`OM_CACHE_PACK_TICKET_STATE_UPDATES=true`を有効にして複数チケットの状態更新を単一のRedis Streamエントリにまとめることを検討してください（**重要**: `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`は、同じRedisインスタンスから読み取るすべての`om-core`インスタンスがパックされたストリームエントリ形式をサポートするバージョンにアップグレードされた後にのみ有効にしてください）。
+
+### **エンドツーエンド（E2E）テストと負荷テスト**
+
+* **自動化された6ステージE2Eテストスイート ([`../e2e/README.md`](../e2e/README.md))**: `om-core`およびv2エコシステムコンポーネントを6つのステージ（モノリシックベースライン、複数インスタンス間のRedisレプリケーション、パックされたチケット状態更新、非アクティブ化タイムアウト耐性、部分的な有効化エラー処理、およびCloud Pub/Subを用いたマイクロサービス構成）にわたって検証します。ビルド済みの`om-core`イメージタグを指定してCloud Build + Cloud Run上で実行する方法（`../e2e/cloudbuild-e2e.yaml`）と、ローカルのインメモリ環境で実行する方法（`go run ./e2e/cmd/e2e-runner --local`）の両方をサポートしています。
+* **対話型TPC負荷テスト ([`matchmaker/LOADTEST.md`](matchmaker/LOADTEST.md))**: ローカルの`om-core`に対してサイクルあたりのチケット数（TPC）を段階的に変化させたり、障害注入を行ったりするためのガイドとスクリプト（`../hack/loadtest.sh`）です。
+
