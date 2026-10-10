@@ -34,7 +34,7 @@ Step #1: [builder] Installing Go v1.24.6.
 このリポジトリには、[Google Cloud 上の Cloud Build を使用してリモートでビルドする](https://cloud.google.com/docs/buildpacks/build-application#remote_builds)ために必要なファイルが含まれています。リポジトリをクローンし、`gcloud` を初期化し、`myregistry` という名前の既存の [Docker Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images) がある状態での典型的なビルド手順は以下のようになります：
 ```
 # 依存関係を最新バージョンに更新し、テストを実行して、Cloud Buildを開始する
-go get -u -t examples/... && go mod tidy  && go vet examples/... && go test -race examples/... && gcloud builds submit --async --substitutions=COMMIT_SHA=abc123,_ARTIFACT_REGISTRY_URI=myregistry,_GOOGLE_BUILDABLE=./examples/mmf,_JOB_NAME=soloduel
+go get $(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}@latest{{end}}' all) && go mod tidy && go vet ./... && go test -race ./... && gcloud builds submit --async --substitutions=COMMIT_SHA=abc123,_ARTIFACT_REGISTRY_URI=myregistry,_GOOGLE_BUILDABLE=./examples/mmf,_JOB_NAME=soloduel
 ```
 `_GOOGLE_BUILDABLE` には `examples/` ディレクトリ内のアプリケーションの1つ（`main.go` ファイルを含むディレクトリ）を指定します。`_JOB_NAME` は生成されるコンテナイメージの名前になります（デフォルトでは現在のgitコミットSHAでタグ付けされます）。
 

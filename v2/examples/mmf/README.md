@@ -23,7 +23,7 @@ We test builds [remotely using Cloud Build on Google Cloud](https://cloud.google
 cd <repo>/v2
 
 # Update the dependencies to the latest versions and kick off a Cloud Build
-go get -u && go mod tidy && gcloud builds submit --async --pack \
+go get $(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}@latest{{end}}' all) && go mod tidy && gcloud builds submit --async --pack \
 image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match/soloduel,env=GOOGLE_BUILDABLE=./examples/mmf
 ```
 

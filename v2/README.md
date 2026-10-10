@@ -33,7 +33,7 @@ use the lower of these two versions (typically the pack builder lags behind) in 
 This repo includes the files required to build [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds).  A typical build goes something like this, with the repo cloned,  `gcloud` initialized, and an existing [Docker Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images) called `myregistry`:
 ```
 # Update the dependencies to the latest versions, test, and kick off a Cloud Build
-go get -u -t examples/... && go mod tidy  && go vet examples/... && go test -race examples/... && gcloud builds submit --async --substitutions=COMMIT_SHA=abc123,_ARTIFACT_REGISTRY_URI=myregistry,_GOOGLE_BUILDABLE=./examples/mmf,_JOB_NAME=soloduel
+go get $(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}@latest{{end}}' all) && go mod tidy && go vet ./... && go test -race ./... && gcloud builds submit --async --substitutions=COMMIT_SHA=abc123,_ARTIFACT_REGISTRY_URI=myregistry,_GOOGLE_BUILDABLE=./examples/mmf,_JOB_NAME=soloduel
 ```
 The `_GOOGLE_BUILDABLE` should be one of the applications in the `examples/`
 directory (containing a `main.go` file), and the `_JOB_NAME` will be the name of
