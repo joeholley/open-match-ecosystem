@@ -760,10 +760,10 @@ func TestCreateTicket_ContextCancellation(t *testing.T) {
 	})
 }
 
-// TestValidateConnection verifies that ValidateConnection probes POST /tickets:deactivate
-// with an empty DeactivateTicketsRequest (without creating dummy tickets), accepts
+// TestValidateConnection verifies that ValidateConnection probes POST /tickets:activate
+// with an empty ActivateTicketsRequest (without creating dummy tickets), accepts
 // HTTP 200 OK and HTTP 400 Bad Request, and returns an error on auth/routing/server
-// error status codes (401, 403, 404, 503).
+// error status codes (401, 403, 404, 501, 503).
 func TestValidateConnection(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -771,10 +771,11 @@ func TestValidateConnection(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "200 OK succeeds", statusCode: http.StatusOK, wantErr: false},
-		{name: "400 Bad Request from live om-core empty DeactivateTickets succeeds", statusCode: http.StatusBadRequest, wantErr: false},
+		{name: "400 Bad Request from live om-core empty ActivateTickets succeeds", statusCode: http.StatusBadRequest, wantErr: false},
 		{name: "401 Unauthorized fails", statusCode: http.StatusUnauthorized, wantErr: true},
 		{name: "403 Forbidden fails", statusCode: http.StatusForbidden, wantErr: true},
 		{name: "404 Not Found fails", statusCode: http.StatusNotFound, wantErr: true},
+		{name: "501 Not Implemented fails", statusCode: http.StatusNotImplemented, wantErr: true},
 		{name: "503 Service Unavailable fails", statusCode: http.StatusServiceUnavailable, wantErr: true},
 	}
 
@@ -812,15 +813,15 @@ func TestValidateConnection(t *testing.T) {
 			if gotMethod != http.MethodPost {
 				t.Errorf("ValidateConnection HTTP method = %q, want POST", gotMethod)
 			}
-			if gotPath != "/tickets:deactivate" {
-				t.Errorf("ValidateConnection HTTP path = %q, want /tickets:deactivate", gotPath)
+			if gotPath != "/tickets:activate" {
+				t.Errorf("ValidateConnection HTTP path = %q, want /tickets:activate", gotPath)
 			}
-			var deactReq pb.DeactivateTicketsRequest
-			if uErr := protojson.Unmarshal(gotReqBody, &deactReq); uErr != nil {
-				t.Errorf("ValidateConnection body did not unmarshal as DeactivateTicketsRequest: %v", uErr)
+			var actReq pb.ActivateTicketsRequest
+			if uErr := protojson.Unmarshal(gotReqBody, &actReq); uErr != nil {
+				t.Errorf("ValidateConnection body did not unmarshal as ActivateTicketsRequest: %v", uErr)
 			}
-			if len(deactReq.GetTicketIds()) != 0 {
-				t.Errorf("ValidateConnection DeactivateTicketsRequest.TicketIds = %v, want empty", deactReq.GetTicketIds())
+			if len(actReq.GetTicketIds()) != 0 {
+				t.Errorf("ValidateConnection ActivateTicketsRequest.TicketIds = %v, want empty", actReq.GetTicketIds())
 			}
 		})
 	}

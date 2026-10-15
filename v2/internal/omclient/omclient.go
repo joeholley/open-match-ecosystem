@@ -742,16 +742,16 @@ func readAllBody(resp http.Response, logger *logrus.Entry) ([]byte, error) {
 // against the provided Open Match core URL without writing dummy tickets to state
 // storage.
 //
-// It probes "/tickets:deactivate" with an empty DeactivateTicketsRequest. On a
-// live om-core instance, DeactivateTickets validates the empty request in memory
-// and returns HTTP 400 Bad Request (codes.InvalidArgument) without touching Redis
-// or recording ticket metrics; stub test servers may also return HTTP 200 OK.
-// Any other HTTP status code (such as 401/403 auth rejection, 404 wrong route,
-// or 5xx server failure) or transport error is returned as an error, and
-// resp.Body is always drained and closed so the underlying connection can be
+// It probes "POST /tickets:activate" with an empty ActivateTicketsRequest. On a
+// live om-core instance, ActivateTickets validates the empty request in memory
+// and returns HTTP 400 Bad Request (codes.InvalidArgument) without touching Redis,
+// logging errors, or recording ticket metrics; stub test servers may also return
+// HTTP 200 OK. Any other HTTP status code (such as 401/403 auth rejection, 404
+// wrong route, or 5xx server failure) or transport error is returned as an error,
+// and resp.Body is always drained and closed so the underlying connection can be
 // reused by http.Transport.
 func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url string) error {
-	buf, err := protojson.Marshal(&pb.DeactivateTicketsRequest{})
+	buf, err := protojson.Marshal(&pb.ActivateTicketsRequest{})
 	if err != nil {
 		return err
 	}
@@ -760,7 +760,7 @@ func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url strin
 		rc.Log.WithFields(logrus.Fields{
 			"operation": "proxy_ValidateConnection",
 		}),
-		url, "/tickets:deactivate", buf)
+		url, "/tickets:activate", buf)
 	if resp != nil && resp.Body != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
