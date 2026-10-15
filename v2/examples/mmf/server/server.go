@@ -27,6 +27,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -50,27 +51,53 @@ var (
 	NoSuchKeyError = errors.New("Extension field contains no such key")
 )
 
-// StartServer creates and starts the Match Function server
+// StartServer creates and starts the Match Function server using context.Background().
 func StartServer(port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
-	var err error
-	log = l
-	logger = log.WithFields(logfields)
+	return StartServerWithContext(context.Background(), port, mmfServer, l)
+}
+
+// StartServerWithContext creates and starts the Match Function gRPC server and
+// gracefully stops it when ctx is cancelled.
+func StartServerWithContext(ctx context.Context, port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
+	if l != nil {
+		log = l
+		logger = log.WithFields(logfields)
+	}
 
 	// Create and host a new gRPC service on the requested port.
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		logger.Fatalf("TCP net listener initialization failed for port %v, got %s", port, err.Error())
+		logger.Errorf("TCP net listener initialization failed for port %v, got %s", port, err.Error())
+		return err
 	}
 
 	logger.Infof("MMF gRPC Server starting on TCP port %v ", port)
 	var opts []grpc.ServerOption
 	server := grpc.NewServer(opts...)
 	pb.RegisterMatchMakingFunctionServiceServer(server, mmfServer)
-	if err = server.Serve(ln); err != nil {
-		logger.Fatalf("gRPC serve failed, got %s", err.Error())
+
+	// Watch for context cancellation to trigger graceful gRPC server shutdown.
+	// Closing serveDone when server.Serve returns ensures this watcher goroutine
+	// always exits even if Serve terminates before ctx is cancelled.
+	serveDone := make(chan struct{})
+	defer close(serveDone)
+	if ctx != nil && ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				logger.Info("Shutting down MMF gRPC Server gracefully...")
+				server.GracefulStop()
+			case <-serveDone:
+			}
+		}()
 	}
 
-	return err
+	if err = server.Serve(ln); err != nil {
+		logger.Errorf("gRPC serve failed, got %s", err.Error())
+		return err
+	}
+
+	return nil
 }
 
 // GetChunkedRequest receives a MMF Server request stream sending partial

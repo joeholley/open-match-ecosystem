@@ -29,8 +29,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
@@ -53,6 +56,10 @@ func newMMFServer(name string, logger *logrus.Logger) (pb.MatchMakingFunctionSer
 }
 
 func main() {
+	// Cancel ctx on SIGTERM/SIGINT so the gRPC MMF server drains in-flight
+	// streams via GracefulStop before the container exits.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	// Init viper config with default port and MMF implementation
 	cfg := viper.New()
@@ -76,5 +83,7 @@ func main() {
 	}
 
 	// Start a gRPC server that handles MMF requests
-	server.StartServer(cfg.GetInt32("PORT"), customMatchingLogic, logger)
+	if err := server.StartServerWithContext(ctx, cfg.GetInt32("PORT"), customMatchingLogic, logger); err != nil {
+		logger.Fatal(err)
+	}
 }

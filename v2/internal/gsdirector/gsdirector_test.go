@@ -777,3 +777,181 @@ func TestMockDirectorRun_ProposalsLoopHandlesMissingAndPresentBackfillExtension(
 		t.Errorf("AssignmentPublisher.Send called %d times, want 2", len(sender.rosters))
 	}
 }
+
+type notifyGSManager struct {
+	stubGSManager
+	firstCallOnce sync.Once
+	firstCallCh   chan struct{}
+}
+
+func (n *notifyGSManager) GetMMFParams() []*pb.MmfRequest {
+	n.firstCallOnce.Do(func() {
+		close(n.firstCallCh)
+	})
+	return n.stubGSManager.GetMMFParams()
+}
+
+// TestMockDirectorRun_ContextCancelInterruptsInterCycleSleepAndFlushesReactivations
+// verifies that:
+//  1. Cancelling ctx during the inter-cycle sleep (MM_CYCLE_MIN_DURATION_MS=30000)
+//     wakes MockDirector.Run immediately instead of blocking for 30 seconds.
+//  2. When MockDirector.Run finishes its configured NUM_MM_CYCLES without ctx
+//     being cancelled, defer close(ticketIdsToActivate) and reactivationWg.Wait()
+//     flush any queued rejected tickets to /tickets:activate and exit the
+//     background reactivation goroutine before Run returns.
+func TestMockDirectorRun_ContextCancelInterruptsInterCycleSleepAndFlushesReactivations(t *testing.T) {
+	t.Run("context cancel interrupts long inter-cycle sleep", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cfg := viper.New()
+		cfg.Set("NUM_MM_CYCLES", 100)
+		cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 0)
+		cfg.Set("MM_CYCLE_MIN_DURATION_MS", 30000) // 30s sleep per cycle
+		cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+		cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+
+		log := logrus.New()
+		log.SetOutput(io.Discard)
+
+		gsMgr := &notifyGSManager{
+			firstCallCh: make(chan struct{}),
+		}
+
+		d := &MockDirector{
+			OmClient:     omclient.New(cfg, log, &http.Client{}),
+			GSManager:    gsMgr,
+			Cfg:          cfg,
+			Log:          log,
+			OtelMeterPtr: testMeter(),
+		}
+
+		runDone := make(chan struct{})
+		start := time.Now()
+		go func() {
+			defer close(runDone)
+			d.Run(ctx)
+		}()
+
+		select {
+		case <-gsMgr.firstCallCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for cycle 1 GetMMFParams")
+		}
+
+		// Give cycle 1 a few milliseconds to enter the 30-second inter-cycle timer select,
+		// then cancel ctx.
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+
+		select {
+		case <-runDone:
+			if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+				t.Errorf("MockDirector.Run took %v to exit after ctx cancel, want < 1.5s", elapsed)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for MockDirector.Run to exit during inter-cycle sleep")
+		}
+	})
+
+	t.Run("Run closes ticketIdsToActivate and flushes rejected tickets on normal cycle completion", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		log := logrus.New()
+		log.SetOutput(io.Discard)
+
+		const (
+			validReqHash     = "hash-valid-1"
+			rejectedTicketID = "ticket-rejected-on-exit"
+		)
+		validHashAny, _ := anypb.New(&knownpb.StringValue{Value: validReqHash})
+		unknownHashAny, _ := anypb.New(&knownpb.StringValue{Value: "hash-unknown-stale"})
+		allocAny, _ := anypb.New(&knownpb.StringValue{Value: `{"spec":"fleet-1"}`})
+
+		var (
+			mu             sync.Mutex
+			reactivatedIDs []string
+		)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/matches:fetch":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				// Stream a match with an unknown MMFRequestHashKey so ProposalsLoop
+				// rejects it deterministically and sends rejectedTicketID to ticketIdsToActivate.
+				m := &pb.Match{
+					Id: "match-with-unknown-hash",
+					Rosters: map[string]*pb.Roster{
+						"r1": {Tickets: []*pb.Ticket{{Id: rejectedTicketID}}},
+					},
+					Extensions: map[string]*anypb.Any{
+						ex.MMFRequestHashKey: unknownHashAny,
+					},
+				}
+				raw, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: m})
+				_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(raw))
+			case "/tickets:activate":
+				body, _ := io.ReadAll(r.Body)
+				var reqPb pb.ActivateTicketsRequest
+				_ = protojson.Unmarshal(body, &reqPb)
+				mu.Lock()
+				reactivatedIDs = append(reactivatedIDs, reqPb.GetTicketIds()...)
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := viper.New()
+		cfg.Set("OM_CORE_ADDR", srv.URL)
+		cfg.Set("NUM_MM_CYCLES", 50)
+		cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 0)
+		cfg.Set("MM_CYCLE_MIN_DURATION_MS", 0)
+		cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+		// Set batch size to 500 so closing ticketIdsToActivate on Run exit is what
+		// flushes the single rejected ticket before Run returns.
+		cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+
+		gsMgr := &stubGSManager{
+			requests: []*pb.MmfRequest{
+				{
+					Mmfs: []*pb.MatchmakingFunctionSpec{Fifo},
+					Profile: &pb.Profile{
+						Name: "dev.open-match.fleet-1.1",
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: validHashAny,
+							ex.AgonesAllocatorKey: allocAny,
+						},
+					},
+				},
+			},
+		}
+
+		// Run 1 cycle when the match is rejected by unknown hash (even if the 2%
+		// random test rejection fires first, rejectMatch still queues rejectedTicketID!).
+		cfg.Set("NUM_MM_CYCLES", 1)
+		d := &MockDirector{
+			OmClient:     omclient.New(cfg, log, srv.Client()),
+			GSManager:    gsMgr,
+			Cfg:          cfg,
+			Log:          log,
+			OtelMeterPtr: testMeter(),
+		}
+
+		// Do NOT cancel ctx before d.Run(ctx) returns; verify d.Run flushes
+		// ticketIdsToActivate via defer close(ticketIdsToActivate) + reactivationWg.Wait().
+		d.Run(ctx)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(reactivatedIDs) != 1 || reactivatedIDs[0] != rejectedTicketID {
+			t.Errorf("reactivatedIDs after Run() returned = %v, want [%q]", reactivatedIDs, rejectedTicketID)
+		}
+	})
+}

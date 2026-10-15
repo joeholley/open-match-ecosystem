@@ -387,6 +387,11 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 	tpcLogger := q.Log.WithFields(logrus.Fields{"component": "tester", "operation": "generate_tickets"})
 
 	for i := q.Cfg.GetInt("TICKET_CREATION_CYCLES"); i > 0; i-- {
+		// Stop starting new ticket-generation cycles once ctx has been cancelled.
+		if ctx.Err() != nil {
+			return
+		}
+
 		// Channel where we will put one struct for each ticket we want to create this second.
 		tq := make(chan struct{})
 
@@ -402,6 +407,7 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 			// Start a new cycle after 1 second, whether we queued the requested TPC or not.
 			deadlineDur := time.Millisecond * time.Duration(q.Cfg.GetInt("TICKET_CREATION_CYCLE_DURATION_MS"))
 			deadline := time.NewTimer(deadlineDur)
+			defer deadline.Stop()
 			startTime := time.Now()
 
 			var numTixQueued int64
@@ -411,6 +417,8 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 			tqCh := tq
 			for {
 				select {
+				case <-ctx.Done():
+					return
 				// Read all the structs put into the channel by the tpc goroutine below.
 				case _, ok := <-tqCh:
 					if ok {
@@ -420,23 +428,33 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 						// Make a channel on which the queue will return
 						// its http.Status result (not used in tests)
 						rChan := make(chan int)
-						q.ClientRequestChan <- &ClientRequest{
+						// Guard the send on ctx.Done() so this goroutine does not deadlock
+						// if q.Run(ctx) has already exited on context cancellation.
+						select {
+						case q.ClientRequestChan <- &ClientRequest{
 							ResultChan: rChan,
 							// Use the provided internal library to generate a simple
 							// ticket with a few example attributes for testing.
 							Ticket: newTicket(ctx),
+						}:
+						case <-ctx.Done():
+							return
 						}
 
 						// In this example, we simply count the ticket creation results.
 						go func() {
-							status := <-rChan
-							success := int64(1)
-							if status != http.StatusOK {
-								success = int64(0)
+							select {
+							case status := <-rChan:
+								success := int64(1)
+								if status != http.StatusOK {
+									success = int64(0)
+								}
+								ticketCounterMutex.Lock()
+								numTixQueued += success
+								ticketCounterMutex.Unlock()
+							case <-ctx.Done():
+								return
 							}
-							ticketCounterMutex.Lock()
-							numTixQueued += success
-							ticketCounterMutex.Unlock()
 						}()
 
 					} else {
@@ -483,14 +501,20 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 		// Simple tpc goroutine that puts one struct in the channel for every ticket
 		// we want to generate this second.
 		go func(ch chan struct{}) {
+			defer close(ch)
 			// TPC can be updated at any time, so protect it with a mutex.
 			tpcMutex.Lock()
 			thisTPC := q.TPC
 			tpcMutex.Unlock()
 			for i := thisTPC; i > 0; i-- {
-				ch <- struct{}{}
+				// Select on ctx.Done() so this producer goroutine never blocks
+				// forever if the consumer goroutine exits early on cancellation.
+				select {
+				case ch <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
 			}
-			close(ch)
 		}(tq)
 
 		// Wait for ticket creation goroutine to hit the 1 second deadline.

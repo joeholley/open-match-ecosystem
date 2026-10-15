@@ -20,9 +20,11 @@ import (
 	"errors"
 	"io"
 	"math"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
@@ -473,4 +475,65 @@ func TestDebugRun_StreamsDiagnosticMatchWithMinInt32Score(t *testing.T) {
 	if err != nil || profName != "com.example.debug_profile" {
 		t.Fatalf("debug match profileName = %q (err=%v), want %q", profName, err, "com.example.debug_profile")
 	}
+}
+
+// TestStartServerWithContext_ListenErrorAndGracefulStop verifies that:
+//  1. server.StartServerWithContext returns a non-nil error (without calling
+//     os.Exit via logger.Fatalf) when net.Listen fails on an invalid port.
+//  2. server.StartServerWithContext starts serving on a valid TCP port and
+//     returns nil cleanly via server.GracefulStop() when ctx is cancelled.
+func TestStartServerWithContext_ListenErrorAndGracefulStop(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	t.Run("invalid port returns listen error without calling os.Exit", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := server.StartServerWithContext(ctx, -1, fifo.NewWithLogger(logger), logger)
+		if err == nil {
+			t.Fatal("expected non-nil error from StartServerWithContext on invalid port -1, got nil")
+		}
+	})
+
+	t.Run("context cancellation triggers GracefulStop and returns nil", func(t *testing.T) {
+		// Reserve an ephemeral port, close the listener, and pass that port to StartServerWithContext.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to allocate ephemeral port: %v", err)
+		}
+		port := int32(ln.Addr().(*net.TCPAddr).Port)
+		_ = ln.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- server.StartServerWithContext(ctx, port, fifo.NewWithLogger(logger), logger)
+		}()
+
+		// Wait until the gRPC server is accepting TCP connections on port.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			conn, dialErr := net.DialTimeout("tcp", ln.Addr().String(), 50*time.Millisecond)
+			if dialErr == nil {
+				_ = conn.Close()
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Cancel ctx to trigger server.GracefulStop().
+		cancel()
+
+		select {
+		case serveErr := <-errCh:
+			if serveErr != nil {
+				t.Fatalf("StartServerWithContext returned error after ctx cancel: %v, want nil", serveErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for StartServerWithContext to stop after ctx cancellation")
+		}
+	})
 }

@@ -68,6 +68,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -143,7 +144,14 @@ func main() {
 	} else {
 		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
 	}
-	defer otelShutdownFunc(ctx) //nolint:errcheck
+	// Use a fresh bounded context for OpenTelemetry shutdown because the main
+	// application ctx is cancelled when a termination signal arrives, and
+	// otelShutdownFunc needs an active context deadline to flush final metrics.
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = otelShutdownFunc(shutdownCtx)
+	}()
 
 	// Initialize assignment distribution
 	var receiver assignmentdistributor.Receiver
@@ -233,10 +241,16 @@ func main() {
 		}
 	}()
 
-	// Wait for quit signal
+	// Wait for quit signal, then cancel ctx first so q.Run stops processing new
+	// ticket batches before shutting down the assignment receiver and HTTP server.
 	<-signalChan
+	cancel()
 	receiver.Stop()
-	if err := srv.Shutdown(ctx); err != nil {
+	// Pass a fresh bounded context to srv.Shutdown rather than the already-cancelled
+	// application ctx so in-flight HTTP requests have a grace period to complete.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Fatal(err)
 	}
 	logger.Info("Exiting...")

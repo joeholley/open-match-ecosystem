@@ -656,3 +656,49 @@ func TestProxyCreateTicket_AbortsRetryBackoffOnContextCancel(t *testing.T) {
 		t.Fatal("timed out waiting for proxyCreateTicket to abort retry backoff on ctx cancellation")
 	}
 }
+
+// TestGenerateTestTickets_ExitsImmediatelyOnContextCancel verifies that
+// MatchmakerQueue.GenerateTestTickets checks ctx.Err() and selects on ctx.Done()
+// in both its consumer and producer goroutines so cancelling ctx mid-cycle exits
+// immediately even when TICKET_CREATION_CYCLE_DURATION_MS is 30 seconds and no
+// reader is draining q.ClientRequestChan.
+func TestGenerateTestTickets_ExitsImmediatelyOnContextCancel(t *testing.T) {
+	q, _ := newTestQueue("http://127.0.0.1:0", 5, 10)
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 100)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 30000) // 30s per cycle
+	registerMetrics(q.OtelMeterPtr)
+
+	q.SetTestTicketConfig(500, func(context.Context) *pb.Ticket {
+		return &pb.Ticket{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	doneCh := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(doneCh)
+		q.GenerateTestTickets(ctx)
+	}()
+
+	// Read a single ClientRequest to confirm GenerateTestTickets is actively
+	// running inside cycle 1, then leave q.ClientRequestChan unbuffered/undrained
+	// and cancel ctx.
+	select {
+	case <-q.ClientRequestChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first generated test ticket")
+	}
+
+	cancel()
+
+	select {
+	case <-doneCh:
+		if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+			t.Errorf("GenerateTestTickets took %v to exit after ctx cancel, want < 1.5s", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for GenerateTestTickets to exit on ctx cancellation")
+	}
+}

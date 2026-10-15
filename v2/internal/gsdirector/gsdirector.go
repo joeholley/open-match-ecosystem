@@ -1070,6 +1070,16 @@ func (d *MockDirector) Run(ctx context.Context) {
 	// var init
 	d.pendingMmfRequestsByHash = make(map[string]*pb.MmfRequest)
 	ticketIdsToActivate := make(chan string, 10000)
+	var reactivationWg sync.WaitGroup
+	reactivationWg.Add(1)
+	// Close ticketIdsToActivate and wait for the background ticket re-activation
+	// goroutine to drain any remaining IDs before Run returns, even when Run
+	// terminates via NUM_MM_CYCLES or NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT
+	// without ctx being cancelled.
+	defer func() {
+		close(ticketIdsToActivate)
+		reactivationWg.Wait()
+	}()
 	var startTime time.Time
 	var proposedMatches []*pb.Match
 	var proposedMatchesMu sync.Mutex
@@ -1095,13 +1105,17 @@ func (d *MockDirector) Run(ctx context.Context) {
 	// We'll send all ticket ids from rejected matches to the
 	// ticketIdsToActivate channel.
 	go func() {
+		defer reactivationWg.Done()
 		aLogger := logger.WithFields(logrus.Fields{"operation": "ticket_reactivation"})
 		aLogger.Trace("requesting re-activation of rejected tickets")
 
 		// request re-activation of rejected tickets and record any permanent per-ticket failures.
 		atCtx := context.WithValue(ctx, "activationType", "re-activate")
 		reactivationResults := make(chan omclient.ActivationResult, 1000)
+		var resultsWg sync.WaitGroup
+		resultsWg.Add(1)
 		go func() {
+			defer resultsWg.Done()
 			for res := range reactivationResults {
 				if res.Err != nil {
 					aLogger.WithField("ticket_id", res.TicketId).Errorf("Ticket re-activation failed: %v", res.Err)
@@ -1111,6 +1125,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		}()
 		d.OmClient.ActivateTicketsWithResults(atCtx, ticketIdsToActivate, reactivationResults)
 		close(reactivationResults)
+		resultsWg.Wait()
 	}()
 
 	// Kick off main matchmaking loop
@@ -1119,6 +1134,10 @@ func (d *MockDirector) Run(ctx context.Context) {
 	lLogger.Debugf("Beginning matchmaking cycle, %v cycles configured", d.Cfg.GetInt("NUM_MM_CYCLES"))
 	consecutiveEmptyCycles := 0
 	for i := d.Cfg.GetInt("NUM_MM_CYCLES"); i > 0; i-- { // Main Matchmaking Loop
+		// Exit before starting a new matchmaking cycle if the caller cancelled ctx.
+		if ctx.Err() != nil {
+			break
+		}
 
 		// Loop var init
 		startTime = time.Now()
@@ -1716,9 +1735,18 @@ func (d *MockDirector) Run(ctx context.Context) {
 			break
 		}
 
-		// Sleep the calculated time.
+		// Sleep the calculated time, or exit immediately if ctx is cancelled
+		// during the inter-cycle wait instead of blocking until sleepDur elapses.
 		if sleepDur > 0 {
-			time.Sleep(sleepDur)
+			timer := time.NewTimer(sleepDur)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+			if ctx.Err() != nil {
+				break
+			}
 		}
 	} // end of main matchmaking loop
 }
