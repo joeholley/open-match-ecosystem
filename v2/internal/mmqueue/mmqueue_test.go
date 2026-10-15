@@ -1081,3 +1081,65 @@ func TestMatchmakerQueueRun_AssignmentDeliveryAndMetrics(t *testing.T) {
 		t.Errorf("mmqueue.ticket.queued_durations Sum = %v, want > 0", totalSum)
 	}
 }
+
+// TestGenerateTestTickets_ZeroInitialTPCInitializesMetricsWithoutPanic verifies
+// that starting GenerateTestTickets(ctx) with TPC=0 before Run(ctx) has
+// registered OpenTelemetry instruments initializes metrics via ensureMetrics
+// without panicking on a nil otelTicketGenerationCycleDurations histogram.
+func TestGenerateTestTickets_ZeroInitialTPCInitializesMetricsWithoutPanic(t *testing.T) {
+	// Reset package-level instruments to nil to simulate fresh process startup
+	// before either Run(ctx) or GenerateTestTickets(ctx) has called registerMetrics.
+	otelTicketGenerationCycleDurations = nil
+	otelTicketGenerationsAchievedPerCycle = nil
+
+	q, _ := newTestQueue("http://127.0.0.1:0", 5, 10)
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 1)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 20)
+	q.SetTestTicketConfig(0, func(context.Context) *pb.Ticket {
+		return &pb.Ticket{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Must complete cleanly without nil-pointer dereference panic.
+	q.GenerateTestTickets(ctx)
+
+	if otelTicketGenerationCycleDurations == nil {
+		t.Fatal("expected GenerateTestTickets to initialize otelTicketGenerationCycleDurations via ensureMetrics")
+	}
+}
+
+// TestGenerateTestTickets_RespectsDeadlineWhenQueueFull verifies that when
+// ClientRequestChan is unbuffered and undrained (simulating a saturated queue),
+// GenerateTestTickets exits each cycle promptly when the cycle deadline timer
+// fires rather than blocking indefinitely on ClientRequestChan.
+func TestGenerateTestTickets_RespectsDeadlineWhenQueueFull(t *testing.T) {
+	q, _ := newTestQueue("http://127.0.0.1:0", 1, 10)
+	q.ClientRequestChan = make(chan *ClientRequest) // unbuffered, no reader
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 2)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 50) // 50ms per cycle
+
+	q.SetTestTicketConfig(100, func(context.Context) *pb.Ticket {
+		return &pb.Ticket{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		q.GenerateTestTickets(ctx)
+	}()
+
+	select {
+	case <-doneCh:
+		if elapsed := time.Since(start); elapsed > 1*time.Second {
+			t.Errorf("GenerateTestTickets took %v for two 50ms cycles with full queue, want < 1s", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for GenerateTestTickets to finish 2 cycles when ClientRequestChan is full")
+	}
+}
