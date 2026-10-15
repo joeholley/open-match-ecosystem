@@ -73,8 +73,16 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	})
 
 	// Var init
-	var wg sync.WaitGroup
+	var (
+		wg                sync.WaitGroup
+		pendingMu         sync.Mutex
+		activationsClosed bool
+	)
 	ticketIdsToActivate := make(chan string, 10000)
+	// pendingActivations maps each created ticket ID to the client ResultChan(s)
+	// waiting for ActivateTicketsWithResults to confirm that the ticket is active
+	// in om-core before returning HTTP 200 OK (or HTTP 500 on activation failure).
+	pendingActivations := make(map[string][]chan int)
 
 	// Initialize metrics
 	if q.OtelMeterPtr != nil {
@@ -100,35 +108,71 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		logger.Warnf("Unable to add matchmaking queue metrics to the OTEL configuration")
 	}
 
-	// Control number of concurrent requests by creating ticket creation 'slots'
+	// Control number of concurrent requests by creating ticket creation 'slots'.
+	// Each slot represents one in-flight proxyCreateTicket call to om-core.
 	slots := make(chan struct{}, q.Cfg.GetInt("MAX_CONCURRENT_TICKET_CREATIONS"))
 
 	// Goroutine to read from the incoming ticket request channel, and create
-	// one ticket for each incoming request.  Limit the number of concurrent
+	// one ticket for each incoming request. Limit the number of concurrent
 	// creations by blocking until one of the MAX_CONCURRENT_TICKET_CREATIONS
-	// 'slots' is available.
+	// 'slots' is available, and release the slot inside the worker goroutine
+	// after proxyCreateTicket finishes.
 	// Don't exit the Run() function as long as this goroutine is running.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+
+		var createWg sync.WaitGroup
+		defer func() {
+			// Wait for all in-flight proxyCreateTicket worker goroutines to
+			// finish enqueueing created ticket IDs before closing
+			// ticketIdsToActivate so ActivateTicketsWithResults drains cleanly.
+			createWg.Wait()
+			close(ticketIdsToActivate)
+		}()
 
 		cLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_creation",
 		})
 		cLogger.Debug("Processing queued ticket creation requests")
 
-		// Loop forever
+		// Loop until ctx is cancelled or ClientRequestChan is closed.
 		for {
-			// Block until one of the MAX_CONCURRENT_TICKET_CREATIONS 'slots' is available
-			slots <- struct{}{}
-
 			logger.Trace("waiting for a new ticket to enter the queue")
-			// Block until a client request is in the channel
-			request := <-q.ClientRequestChan
+			var (
+				request *ClientRequest
+				ok      bool
+			)
+			select {
+			case <-ctx.Done():
+				return
+			case request, ok = <-q.ClientRequestChan:
+				if !ok {
+					return
+				}
+			}
+			if request == nil {
+				continue
+			}
 
-			// Asynchronous concurrent ticket creation
+			// Acquire a concurrency slot after receiving a client request (so an
+			// idle queue never holds a slot while waiting for requests) and abort
+			// cleanly if ctx is cancelled while waiting for a free slot.
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				request.ResultChan <- http.StatusRequestTimeout
+				close(request.ResultChan)
+				return
+			}
+
+			// Asynchronous concurrent ticket creation.
+			// Track the worker in createWg and release the concurrency slot inside
+			// the worker goroutine when proxyCreateTicket completes.
+			createWg.Add(1)
 			go func(request *ClientRequest) {
-				defer close(request.ResultChan)
+				defer createWg.Done()
+				defer func() { <-slots }()
 
 				// proxyCreateTicket implements retries exp bo + jitter
 				id, err := q.proxyCreateTicket(ctx, request.Ticket)
@@ -136,22 +180,35 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 					// Either a permanent error, or retries timed out
 					logger.Errorf("CreateTicket failed: %v", err)
 					request.ResultChan <- http.StatusRequestTimeout
+					close(request.ResultChan)
 					return
 				}
 
-				// Successful ticket creation
-				ticketIdsToActivate <- id
+				// Successful ticket creation: record the ticket in q.Tickets and
+				// register request.ResultChan in pendingActivations BEFORE sending
+				// id on ticketIdsToActivate. This two-stage pipeline ensures:
+				//   1. q.Tickets is populated before the ticket can become active
+				//      and matched by the director.
+				//   2. The client's ResultChan only receives HTTP 200 OK after
+				//      ActivateTicketsWithResults confirms the ticket is active in
+				//      om-core (or HTTP 500 if activation fails).
+				pendingMu.Lock()
+				if activationsClosed {
+					pendingMu.Unlock()
+					request.ResultChan <- http.StatusRequestTimeout
+					close(request.ResultChan)
+					return
+				}
 				q.Tickets.Store(id, struct{}{})
+				pendingActivations[id] = append(pendingActivations[id], request.ResultChan)
+				pendingMu.Unlock()
+
 				otelTicketCreations.Add(ctx, 1)
-
-				// TODO: in reality, we should only send StatusOK back to the client once
-				// the ticket is successfully activated. WIP.
-				request.ResultChan <- http.StatusOK
-
+				select {
+				case ticketIdsToActivate <- id:
+				case <-ctx.Done():
+				}
 			}(request)
-
-			// Release the MAX_CONCURRENT_TICKET_CREATIONS slot
-			<-slots
 		}
 
 	}()
@@ -173,18 +230,55 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		ctx := context.WithValue(ctx, "activationType", "activate")
 
 		activationResults := make(chan omclient.ActivationResult, 1000)
+		var resultsWg sync.WaitGroup
+		resultsWg.Add(1)
 		go func() {
+			defer resultsWg.Done()
 			for res := range activationResults {
 				otelActivationsPerCall.Record(ctx, 1)
+
+				pendingMu.Lock()
+				waiters := pendingActivations[res.TicketId]
+				delete(pendingActivations, res.TicketId)
+				pendingMu.Unlock()
+
 				if res.Err != nil {
 					aLogger.WithField("ticket_id", res.TicketId).Errorf("Ticket activation failed: %v", res.Err)
 					otelTicketActivationFailures.Add(ctx, 1)
+					q.Tickets.Delete(res.TicketId)
+					for _, ch := range waiters {
+						ch <- http.StatusInternalServerError
+						close(ch)
+					}
+					continue
+				}
+
+				for _, ch := range waiters {
+					ch <- http.StatusOK
+					close(ch)
 				}
 			}
+
+			// If ActivateTicketsWithResults exited (e.g., because ctx was cancelled)
+			// while tickets were still awaiting activation, mark activationsClosed and
+			// drain all remaining ResultChans with StatusRequestTimeout so no caller
+			// hangs waiting on a response.
+			pendingMu.Lock()
+			activationsClosed = true
+			for id, waiters := range pendingActivations {
+				delete(pendingActivations, id)
+				q.Tickets.Delete(id)
+				for _, ch := range waiters {
+					ch <- http.StatusRequestTimeout
+					close(ch)
+				}
+			}
+			pendingMu.Unlock()
 		}()
 
 		q.OmClient.ActivateTicketsWithResults(ctx, ticketIdsToActivate, activationResults)
 		close(activationResults)
+		resultsWg.Wait()
 	}()
 
 	// goroutine to process incoming assignments.
@@ -337,7 +431,7 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 						go func() {
 							status := <-rChan
 							success := int64(1)
-							if status == http.StatusRequestTimeout {
+							if status != http.StatusOK {
 								success = int64(0)
 							}
 							ticketCounterMutex.Lock()
