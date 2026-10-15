@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand"
 	"sort"
@@ -595,6 +596,17 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 
 	m.Log.Debug("Initializing matching parameters")
 
+	// Refresh EveryTicket's CreationTimeRangeFilter relative to the current
+	// Init() time so long-running processes or repeated Init() calls do not
+	// inherit a stale package-initialization timestamp.
+	if EveryTicket != nil {
+		now := time.Now()
+		EveryTicket.CreationTimeRangeFilter = &pb.Pool_CreationTimeRangeFilter{
+			Start: timestamppb.New(now.Add(-1 * time.Hour)),
+			End:   timestamppb.New(now.Add(100 * time.Hour)),
+		}
+	}
+
 	// appendPoolParams copies the filters and extensions from src pool to dest
 	// pool, allowing us to combine different pools to create pools
 	// dynamically.
@@ -605,9 +617,11 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 	// the value from the src extension will take precedence.
 	appendPoolParams := func(dest *pb.Pool, src *pb.Pool) (result *pb.Pool) {
 		result = &pb.Pool{}
-		result.TagPresentFilters = append(dest.TagPresentFilters, src.GetTagPresentFilters()...)
-		result.DoubleRangeFilters = append(dest.DoubleRangeFilters, src.GetDoubleRangeFilters()...)
-		result.StringEqualsFilters = append(dest.StringEqualsFilters, src.GetStringEqualsFilters()...)
+		// Clone filter slices into fresh backing arrays so appending src filters
+		// never mutates dest's underlying slice capacity in place.
+		result.TagPresentFilters = append(append([]*pb.Pool_TagPresentFilter(nil), dest.GetTagPresentFilters()...), src.GetTagPresentFilters()...)
+		result.DoubleRangeFilters = append(append([]*pb.Pool_DoubleRangeFilter(nil), dest.GetDoubleRangeFilters()...), src.GetDoubleRangeFilters()...)
+		result.StringEqualsFilters = append(append([]*pb.Pool_StringEqualsFilter(nil), dest.GetStringEqualsFilters()...), src.GetStringEqualsFilters()...)
 
 		// Check that the source has a creation time filter before copying to avoid
 		// an empty src filter overwriting an existing dest filter. This can only
@@ -617,12 +631,14 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 			result.CreationTimeRangeFilter = src.GetCreationTimeRangeFilter()
 		}
 
-		// Combine extensions
-		result.Extensions = dest.Extensions
+		// Clone dest.Extensions into a new map before merging src.Extensions so
+		// composing pools across multiple zones/fleets never mutates the template
+		// pool's Extensions map in place.
+		result.Extensions = maps.Clone(dest.GetExtensions())
 		if result.Extensions == nil {
 			result.Extensions = map[string]*anypb.Any{}
 		}
-		for key, value := range src.Extensions {
+		for key, value := range src.GetExtensions() {
 			result.Extensions[key] = value
 		}
 
@@ -708,13 +724,21 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 						composedPools[composedName] = composedPool
 					}
 
+					// Clone mode.ExtensionParams for each fleet's Profile so that
+					// multiple regional fleets sharing a GameMode (e.g. SoloDuel)
+					// do not alias and overwrite the same underlying Extensions map.
+					profileExtensions := maps.Clone(mode.ExtensionParams)
+					if profileExtensions == nil {
+						profileExtensions = map[string]*anypb.Any{}
+					}
+
 					// Add this mmf request to our list of parameters
 					mGSSet.server.mmfParams = append(mGSSet.server.mmfParams, &pb.MmfRequest{
 						Mmfs: mode.MMFs,
 						Profile: &pb.Profile{
 							Name:       profileName,
 							Pools:      composedPools,
-							Extensions: mode.ExtensionParams, // Include all the user-defined data in the game mode extensions field.
+							Extensions: profileExtensions, // Include all the user-defined data in the game mode extensions field.
 						},
 					})
 
@@ -729,8 +753,11 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 					mpa.mmfParams = append(mpa.mmfParams, string(paramsJSON[:]))
 				}
 
-				// Marshal the array of matchmaking parameters used by game modes in this fleet into JSON
-				mmfParamsJSON, err := json.Marshal(mpa)
+				// Marshal the slice of matchmaking parameters used by game modes in this
+				// fleet into JSON (matching allocationSpecFromMMFRequests; marshaling the
+				// struct mpa directly would produce "{}" because mmfParams is unexported,
+				// causing all fleets to collide on the same hash and allocationSpecJSON).
+				mmfParamsJSON, err := json.Marshal(mpa.mmfParams)
 				if err != nil {
 					fLogger.Errorf("Failed to marshal MMF parameters annotation into JSON: %v", err)
 					return err
@@ -891,8 +918,12 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 			for _, request := range gsSet.server.mmfParams {
 				gLogger.Tracef(" retrieved MmfRequest with profile: %v", request.GetProfile().GetName())
 
-				// retrieve existing profile extensions
-				extensions := request.GetProfile().GetExtensions()
+				// Clone the stored profile extensions into a fresh map before
+				// attaching per-cycle/per-fleet Agones metadata (ready server count,
+				// allocator spec, and MMFRequest hash). This prevents mutating the
+				// stored gsSet.server.mmfParams profile map in place or aliasing
+				// Extensions across returned MmfRequest structs.
+				extensions := maps.Clone(request.GetProfile().GetExtensions())
 				if extensions == nil {
 					// make an empty extensions map if there are no extensions yet
 					extensions = map[string]*anypb.Any{}
@@ -1437,12 +1468,16 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// Common use cases for this are backfills, join-in-progress, and
 			// high-density gameservers that can host additional sessions.
 			// https://agones.dev/site/docs/integration-patterns/high-density-gameservers/
+			// Guard against a nil Extensions map or a missing MMFRequestKey entry
+			// before calling UnmarshalTo (anypb.Any.UnmarshalTo panics if called
+			// on a nil *anypb.Any receiver when a match has no backfill request).
 			nextMMFRequest := &pb.MmfRequest{}
-			err = match.Extensions[ex.MMFRequestKey].UnmarshalTo(nextMMFRequest)
-			if err == nil && nextMMFRequest.GetProfile().GetName() != "" {
-				mLogger.Trace("Approved a match with a backfill request attached, sending backfill request to game server manager")
-				allocatorSpec = d.GSManager.UpdateMMFRequest(allocatorSpec, nextMMFRequest)
-				newMMFRequestsProcessed++
+			if rawBackfill := match.GetExtensions()[ex.MMFRequestKey]; rawBackfill != nil {
+				if err = rawBackfill.UnmarshalTo(nextMMFRequest); err == nil && nextMMFRequest.GetProfile().GetName() != "" {
+					mLogger.Trace("Approved a match with a backfill request attached, sending backfill request to game server manager")
+					allocatorSpec = d.GSManager.UpdateMMFRequest(allocatorSpec, nextMMFRequest)
+					newMMFRequestsProcessed++
+				}
 			}
 
 			for _, roster := range match.GetRosters() {
