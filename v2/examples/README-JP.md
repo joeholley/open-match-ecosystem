@@ -89,15 +89,15 @@ Open Match v2サンプルマッチメーカーの設計は、3つの主要な情
 
 #### **チケット衝突の処理**
 
-Open Match 2は複数のMMFを並行して実行できるため、同じTicketが同一サイクル内で複数のMatch提案に含まれる可能性があります。これらの「チケット衝突」を検出し解決する責任は、完全にDirectorにあります。
+Open Match 2は複数のMMFを並行して実行できるため、同じTicketが同一サイクル内で複数のMatch提案に含まれる可能性があります（また、状態レプリケーションが進行中の場合はサイクル間でも発生し得ます）。これらの「チケット衝突」を検出し解決する責任は、完全にDirectorにあります。
 
 * **衝突の検出**:  
-  * gsdirectorはassignmentsマップを維持しており、これは現在のセッションで正常にゲームサーバーに割り当てられたすべてのチケットIDの記録として機能します。\[v2/internal/gsdirector/gsdirector.go\]  
-  * MMFからマッチ提案のストリームを受け取り、サーバーを割り当てる前に、Directorは各提案マッチを反復処理します。そのマッチ内のすべてのチケットについて、そのチケットIDがassignmentsマップに既に存在するかどうかを確認します。  
+  * `gsdirector`は獲得済みチケットIDのセットを2つ維持しています。**過去のサイクル**でゲームサーバーに正常に割り当てられたすべてのチケットIDを記録する`assignments`マップと、**同一サイクル内**でより優先度の高い提案によって既に獲得されたすべてのチケットIDを記録するサイクル単位の`acceptedInCycle`マップです。\[v2/internal/gsdirector/gsdirector.go\]  
+  * 1サイクル分のすべてのマッチ提案を受け取り、サーバーを割り当てる前に、Directorは候補となる提案をソートし、`backfill.`提案が標準のフリート提案よりも先に評価されるようにします。そのうえで各提案マッチを反復処理し、すべてのチケットIDを`assignments`（サイクル間の衝突）と`acceptedInCycle`（同一サイクル内の重複）の両方と照合します。  
 * **衝突の解決**:  
-  * Directorが提案されたマッチ内に既に割り当て済みのチケットを見つけた場合、これを衝突とみなします。  
+  * Directorが提案されたマッチ内に、`assignments`または`acceptedInCycle`に既に存在するチケットを見つけた場合、これを衝突とみなします。  
   * 衝突するチケットを含むマッチ提案全体は、直ちに**拒否**されます。  
-  * 拒否されたマッチのすべてのチケットは、ActivateTickets APIを介して再有効化のためにom-coreに送り返されます。これにより、（既に割り当てられたプレイヤーを除く）それらのプレイヤーは次のマッチメイキングサイクルで再び利用可能になります。この単純な「先着順」アプローチにより、一度プレイヤーが割り当てられると、別のマッチに配置されることはありません。\[v2/internal/gsdirector/gsdirector.go\]
+  * 拒否されたマッチのうち未獲得のチケット（`assignments`または`acceptedInCycle`に既に含まれているチケットIDは明示的にスキップされます）は、`ActivateTickets` APIを介して再有効化のために`om-core`に送り返されます。これにより、既にマッチが成立したプレイヤーが誤って再有効化されることを防ぎつつ、残りのプレイヤーを次のマッチメイキングサイクルで再び利用可能にします。\[v2/internal/gsdirector/gsdirector.go\]
 
 ##### **`om-core`によるサイクル間衝突の軽減と、レプリケーション遅延・MMF重複の見分け方**
 
@@ -105,16 +105,18 @@ Open Match 2は複数のMMFを並行して実行できるため、同じTicket�
 
 1. **`om-core`がサイクル間の衝突を軽減する仕組み**: MMFが`Match`を返すと、`om-core`はそのマッチのroster内のすべてのチケットIDを検証し、状態ストレージのレプリケーションストリームに非アクティブ化（deactivation）更新を書き込みます。そしてデフォルト（`OM_MATCH_TICKET_DEACTIVATION_WAIT=true`）では、マッチをDirectorへストリームで返す前に、その非アクティブ化がローカルのチケットキャッシュへレプリケートされるまで最大`OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`（デフォルト`60000`ミリ秒）待機します。これにより、通常の状態では、返されたマッチ内のチケットは次のマッチメイキングサイクルが開始される前にローカルキャッシュ上で既に非アクティブとしてマークされています。
 2. **`deactivation_timeout`マッチ拡張フィールド**: ローカルキャッシュへのレプリケーション待機がタイムアウトした場合（またはマッチのすべてのチケット非アクティブ化書き込みがレプリケーションIDの生成に失敗した場合）、`om-core`は`om_core.mmf.deactivation.timeouts`をインクリメントし、返される`Match`に`extensions["deactivation_timeout"] = true`（`google.protobuf.BoolValue`、定数`extensions.MatchDeactivationTimeoutKey`）を設定します。
-   * デフォルト（`REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false`）では、`gsdirector`はそのマッチを**承認**します（多くの場合、Redisへの非アクティブ化書き込み自体は成功しておりローカルキャッシュへの適用だけが遅れているためであり、サイクル間の重複は引き続き`assignments`マップで防止されるためです）。同時に警告ログを出力し、`gsdirector.matchmaking_cycle.match.deactivation_timeouts`（および`gsdirector.matchmaking_cycle.ticket.deactivation_timeouts`）を記録したうえで、次のサイクルのスリープバックオフ（`assignedBackoffFactor`）を増加させて`om-core`のレプリケーションが追いつく時間を与えます。
+   * デフォルト（`REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false`）では、`gsdirector`はそのマッチを**承認**します（多くの場合、Redisへの非アクティブ化書き込み自体は成功しておりローカルキャッシュへの適用だけが遅れているためであり、サイクル間および同一サイクル内の重複は引き続き`assignments`マップと`acceptedInCycle`マップで防止されるためです）。同時に警告ログを出力し、`gsdirector.matchmaking_cycle.match.deactivation_timeouts`（および`gsdirector.matchmaking_cycle.ticket.deactivation_timeouts`）を記録したうえで、次のサイクルのスリープバックオフ（`assignedBackoffFactor`）を増加させて`om-core`のレプリケーションが追いつく時間を与えます。
    * `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=true`を設定すると、`gsdirector`は`deactivation_timeout`が付与されたマッチを即座に拒否し、`ActivateTickets`を介してそれらのチケットを再有効化します。
 3. **レプリケーション遅延と同一サイクル内のMMF重複の区別**: `om-core`は`InvokeMatchmakingFunctions`呼び出しごとにアクティブなチケットのポイントインタイム・スナップショットを取得するため、その呼び出し内で起動されたすべてのMMFは全く同じアクティブプールを参照します。したがって、重複するプールを共有する2つの並行MMF（または同一のDirectorサイクル内で並列に発行された複数の`InvokeMatchmakingFunctions`呼び出し）は、単一サイクル内で同じチケットを含むマッチを正当に提案する可能性があります。
-   * 現在の`gsdirector`サンプルでは、`assignments`マップは`ProposalsLoop`が完了した**後**のゲームサーバー割り当てループ中に更新される点に注意してください。つまり、`assignments`マップは**過去のサイクル**で割り当てられたチケットとの衝突は検出しますが、**同一サイクル内**で承認された複数の提案間にまたがるチケットの重複は排除しません。本番環境で重複するプールを持つ複数のMMFを同一サイクル内で呼び出すDirectorを実装する場合は、同一サイクル内で承認される提案間でもチケットの重複排除を行う必要があります（例えば、候補となる提案をまず`score`順でソートし、ゲームサーバーを割り当てる前にサイクル単位の獲得済みチケットセットを追跡するなど）。
+   * `gsdirector`は（`backfill.`提案を標準のフリート提案より先にソートしたうえで）`ProposalsLoop`内でこれら2つのケースを直接区別して処理します：
+     * **サイクル間の衝突 (`assignments`)**: **過去のサイクル**で既に割り当てられたチケット（`numAssigned > 0`）は、`gsdirector.matchmaking_cycle.match.rejections.assigned`（および`gsdirector.ticket.rejections.assigned`）をインクリメントし、`om-core`のレプリケーションが追いつく時間を与えるために次サイクルのスリープバックオフ（`assignedBackoffFactor`）を増加させます。
+     * **同一サイクル内の重複 (`acceptedInCycle`)**: **同一サイクル内**の先行する提案で獲得されたチケット（`numSameCycleOverlap > 0` かつ `numAssigned == 0`）は、重複した提案を拒否して残りの未獲得チケットを再有効化します（`gsdirector.matchmaking_cycle.match.rejections`をインクリメント）が、`rejections.assigned`のインクリメントやサイクル間のレプリケーション遅延バックオフは発生させません。
 4. **メトリクスのペアリングと対処方法**: マッチメーカー側（`gsdirector.*` / `mmqueue.*`）のメトリクスと`om-core`側（`om_core.*`）のメトリクスを組み合わせて監視することで、チケット衝突やサイクル時間の増加がレプリケーション遅延によるものかMMFの重複によるものかを診断できます：
 
 | v2メトリクスの兆候 | ペアで確認すべき`om-core`メトリクス | 解釈 |
 |---|---|---|
 | `gsdirector.matchmaking_cycle.match.deactivation_timeouts` ↑ | `om_core.mmf.deactivation.timeouts`, `om_core.mmf.deactivation.wait` p99, `om_core.cache.replication.lag` | 非アクティブ化が時間内にローカルキャッシュへ適用されていません。Redis/ストリームのバックログが増加しているか、`OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`が小さすぎます。 |
-| `gsdirector.matchmaking_cycle.match.rejections.assigned` ↑（timeouts = 0） | `om_core.mmf.prep.duration`, MMF重複（`profile.name`属性） | 非アクティブ化のレプリケーション遅延ではありません。プールの重複／同一サイクル内のMMF重複、または`MM_CYCLE_MIN_DURATION_MS`が*再有効化*のレプリケーション遅延より短いことが原因です。 |
+| `gsdirector.matchmaking_cycle.match.rejections.assigned` ↑（timeouts = 0） | `om_core.mmf.prep.duration`, `om_core.cache.replication.lag` | ローカル非アクティブ化タイムアウトを伴わないサイクル間衝突です。`MM_CYCLE_MIN_DURATION_MS`がインスタンス間の非アクティブ化または*再有効化*のレプリケーション遅延より短いことが原因です（同一サイクル内のMMFプール重複は`acceptedInCycle`で捕捉され、`rejections.assigned`をインクリメントせずに`gsdirector.matchmaking_cycle.match.rejections`のみをインクリメントします）。 |
 | `gsdirector.matchmaking_cycle.duration` ↑ | `om_core.mmf.deactivation.wait`, `om_core.cache.incoming.backlog`, `om_core.cache.incoming.apply.duration` | 受信レプリケーションが追いつくまでの`om-core`の非アクティブ化待機時間がマッチメイキングサイクル時間に含まれています。 |
 | `mmqueue.ticket.activations.failures` / `gsdirector.ticket.reactivations.failures` > 0 | `om_core.cache.outgoing.backlog`, `om_core.cache.outgoing.send.duration` | 送信レプリケーション経路が飽和しているか、無効なチケットIDが（再）有効化されています。 |
 | TPCに対するスループットの頭打ち | `om_core.cache.outgoing.updates`, `om_core.cache.incoming.polls.full` | `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`の有効化を検討すべきケースです（すべての`om-core`インスタンスのアップグレード後のみ）。 |

@@ -4,19 +4,24 @@ This example matchmaker is a golang application designed to be built using [CNCF
 
 ## Build
 
-This repo includes the files required to build [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds) in the `<open-match-ecosystem>/v2/` directory.
+This repo includes [`v2/cloudbuild.yaml`](../../cloudbuild.yaml) to build [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds) from the `<open-match-ecosystem>/v2/` directory:
+```bash
+cd <open-match-ecosystem>/v2
+gcloud builds submit --async \
+  --substitutions=COMMIT_SHA=latest,_ARTIFACT_REGISTRY_URI=myregistry,_GOOGLE_BUILDABLE=./examples/matchmaker,_JOB_NAME=matchmaker-example
+```
 
-There is no `cloudbuild.yaml` or `Dockerfile` required for this. [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) takes care of everything.
+[`v2/cloudbuild.yaml`](../../cloudbuild.yaml) invokes [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) (`gcr.io/k8s-skaffold/pack`), so no `Dockerfile` is required.
 
 ## Deploy
-The `deploy/cloudbuild.yaml` file contains steps to deploy a copy of the `matchmaker-example` service to Cloud Run in Google Cloud.
+The [`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml) file contains steps to deploy a copy of the `matchmaker-example` service to Cloud Run in Google Cloud.
 This file should be populated with the following substitutions:
 * `_ARTIFACT_REGISTRY_URI` and `_OTEL_SIDECAR_IMAGE`: Your Artifact Registry repository URI and the `otel-collector-sidecar` image URI (required when `OTEL_SIDECAR=true` so `gsdirector.*` and `mmqueue.*` OpenTelemetry metrics are exported to Google Cloud Monitoring).
 * `_SERVICE_ACCOUNT`: Your Service Account created for `matchmaker-example`. The section below has steps on how to create it with the proper IAM roles.
 * `_OM_CORE_ADDR`: Your `om-core` Cloud Run HTTPS URL reachable from Cloud Run.
 * `_SOLODUEL_ADDR` / `_SOLODUEL_PORT` and `_DEBUGMMF_ADDR` / `_DEBUGMMF_PORT`: Your Cloud Run MMF service URLs (and port `443` when deployed on Cloud Run with `--use-http2`), or `http://localhost` to use the in-process local test MMF servers.
 
-Because `examples/matchmaker` runs continuous background loops (`mmqueue.Run` and `gsdirector.Run`) outside incoming HTTP requests and maintains in-memory ticket and assignment state, `deploy/cloudbuild.yaml` deploys it as an always-on, non-throttled singleton by default (`--no-cpu-throttling --min-instances=1 --max-instances=1`) alongside the `opentelemetry-collector` sidecar container.
+Because `examples/matchmaker` runs continuous background loops (`mmqueue.Run` and `gsdirector.Run`) outside incoming HTTP requests and maintains in-memory ticket and assignment state, [`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml) deploys it as an always-on, non-throttled singleton by default (`--no-cpu-throttling --execution-environment=gen2 --min-instances=1 --max-instances=1`) alongside the `opentelemetry-collector` sidecar container.
 
 Alternatively, with a `service.yaml` file populated with your configuration, you can deploy the service with a command like this:
 ```
@@ -56,12 +61,18 @@ In addition, if you are trying to deploy using the step in the `cloudbuild.yaml`
 
 ## Using the example matchmaker
 
+The example matchmaker exposes three HTTP endpoints on `:${PORT}` (default `:8080`):
+* `POST /tickets` - Submit a client matchmaking request (`Ticket` protobuf/JSON) to the matchmaking queue (`mmqueue`), returning `200 OK` once the ticket is created and activated in `om-core`.
+* `GET` or `POST /tpc/{tixPerCycle}` - Configure the built-in mock client generator to submit `{tixPerCycle}` synthetic tickets per cycle (`INITIAL_TPC=10` by default in `examples/matchmaker`, `0` in `examples/standalone/mmqueue`; capped at `0..10000`).
+* `GET /` - Return the latest plain-text matchmaking cycle status summary (`d.Status()`) from the game server director (`gsdirector`).
+
 The behavior of the example matchmaker can be controlled with environment variables. Here are some variables you may want to set when running locally:
+* `PORT=8080` (default `8080`) - HTTP listen port for the matchmaker server (aligned with Cloud Run and GKE container defaults; override with e.g. `PORT=8081` when running locally on the same host as `om-core` on `:8080`).
 * `LOGGING_FORMAT=text` - Make logs easier to read in the console.
 * `LOGGING_LEVEL=debug` - See more logs for easier troubleshooting.
 * `OTEL_SIDECAR=false` - Don't try to export metrics to an Open Telemetry instance; instead serve Prometheus metrics locally on `localhost:${OTEL_PROM_PORT}/metrics` (default `:2227/metrics`).
 * `SOLODUEL_ADDR` / `SOLODUEL_PORT` (defaults `http://localhost` / `50080`) and `DEBUGMMF_ADDR` / `DEBUGMMF_PORT` (defaults `http://localhost` / `50081`) - Target host and port for the `fifo` and `debug` MMFs. When set to `http://localhost`, the matchmaker starts an in-process gRPC server on the configured port; when set to a remote URL (such as a Cloud Run `https://...` URL with port `443`), `om-core` invokes the remote MMF service over gRPC/TLS.
-* `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false` (default `false`) - Controls how `gsdirector` handles matches returned with `extensions["deactivation_timeout"] = true` (set by `om-core` when `OM_MATCH_TICKET_DEACTIVATION_WAIT=true` and local cache replication of ticket deactivations was not confirmed within `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`). When `false`, the director accepts the match (relying on the `assignments` map to catch cross-cycle collisions), logs a warning, records `gsdirector.matchmaking_cycle.match.deactivation_timeouts` / `gsdirector.matchmaking_cycle.ticket.deactivation_timeouts`, and increases next-cycle sleep backoff. When `true`, the director rejects annotated matches and re-activates their tickets via `ActivateTickets`.
+* `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false` (default `false`) - Controls how `gsdirector` handles matches returned with `extensions["deactivation_timeout"] = true` (set by `om-core` when `OM_MATCH_TICKET_DEACTIVATION_WAIT=true` and local cache replication of ticket deactivations was not confirmed within `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS`). When `false`, the director accepts the match (relying on the `assignments` and `acceptedInCycle` maps to catch cross-cycle and same-cycle collisions), logs a warning, records `gsdirector.matchmaking_cycle.match.deactivation_timeouts` / `gsdirector.matchmaking_cycle.ticket.deactivation_timeouts`, and increases next-cycle sleep backoff. When `true`, the director rejects annotated matches and re-activates their tickets via `ActivateTickets`.
 * `WAIT_FOR_BACKFILL_MMFS=false` (default `false`) - Controls whether `gsdirector` waits for backfill `MmfRequest` invocations to complete before launching fleet `MmfRequest` invocations within the same cycle. When `false` (default), backfill `MmfRequest`s are kicked off first and fleet `MmfRequest`s are started immediately afterward so both see the same player pool. When `true`, `gsdirector` waits for each backfill `MmfRequest` stream to finish (and for `om-core` to deactivate its matched tickets) before starting subsequent `MmfRequest`s.
 * `MM_CYCLE_MIN_DURATION_MS=5000` (default `5000`) - Minimum duration in milliseconds for each matchmaking cycle. Should be set `>=` your observed p99 `om_core.cache.replication.lag` so ticket deactivations and re-activations have time to replicate across `om-core` instances before the next cycle begins. When cross-cycle ticket collisions or `deactivation_timeout` annotations occur, `gsdirector` adaptively multiplies this sleep duration (`assignedBackoffFactor`) to give `om-core` replication time to catch up.
 * `OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500` (default `500`) - Maximum number of ticket IDs sent in a single `ActivateTickets` call. Must be `<=` `om-core`'s `OM_MAX_STATE_UPDATES_PER_CALL` (default `500`), which also bounds the number of ticket IDs packed into a single replication stream entry when `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` on `om-core`.
@@ -72,6 +83,6 @@ Note that the example matchmaker is an example of **all of the pieces of code yo
 ### Future Refactoring Proposal (Director Testability)
 
 `MockDirector.Run()` in `internal/gsdirector/gsdirector.go` intentionally keeps `ProposalsLoop` inline so that the example reads linearly top-to-bottom as an instructional walkthrough. When adapting `gsdirector` for a production codebase with comprehensive unit test suites, we recommend:
-1. **Extracting `ProposalsLoop` into a standalone pure function**: e.g., `evaluateProposal(match *pb.Match, assignments map[string]bool, pendingMmfRequestsByHash map[string]*pb.MmfRequest, cfg *viper.Viper) (decision, reason, stats)`, separating pure match proposal evaluation (checking `deactivation_timeout`, validating `mmfName`/`profileName`/`score`, checking `assignments` for ticket collisions, and extracting backfill `MmfRequest` extensions) from side effects (queueing ticket re-activations, allocating game servers, and recording metrics).
+1. **Extracting `ProposalsLoop` into a standalone pure function**: e.g., `evaluateProposal(match *pb.Match, assignments map[string]bool, acceptedInCycle map[string]bool, pendingMmfRequestsByHash map[string]*pb.MmfRequest, cfg *viper.Viper) (decision, reason, stats)`, separating pure match proposal evaluation (checking `deactivation_timeout`, validating `mmfName`/`profileName`/`score`, checking `assignments` and `acceptedInCycle` for cross-cycle and same-cycle ticket collisions, and extracting backfill `MmfRequest` extensions) from side effects (queueing ticket re-activations, allocating game servers, and recording metrics).
 2. **Extracting `OmClient` behind an interface**: Defining a minimal interface for `InvokeMatchmakingFunctions` and `ActivateTicketsWithResults` so every proposal rejection/acceptance branch and cycle loop behavior can be table-tested directly without standing up an HTTP test server.
 

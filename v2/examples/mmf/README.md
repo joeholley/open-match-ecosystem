@@ -18,20 +18,35 @@ The sample is a golang application designed to be built using [CNCF Buildpacks](
 
 We test builds [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds). A typical build goes something like this, with the repo cloned, `gcloud` initialized, and an existing [Docker Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images) called `open-match`:
 
-```
+```bash
 # The build must be kicked off from the ../../v2 directory.
 cd <repo>/v2
 
-# Update the dependencies to the latest versions and kick off a Cloud Build
-go get $(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}@latest{{end}}' all) && go mod tidy && gcloud builds submit --async --pack \
-image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match/soloduel,env=GOOGLE_BUILDABLE=./examples/mmf
+# Update the dependencies to the latest versions, test, and kick off a Cloud Build using v2/cloudbuild.yaml
+go get $(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}@latest{{end}}' all) && go mod tidy && go vet ./... && go test -race ./... && gcloud builds submit --async \
+  --substitutions=COMMIT_SHA=latest,_ARTIFACT_REGISTRY_URI=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match,_GOOGLE_BUILDABLE=./examples/mmf/,_JOB_NAME=soloduel
 ```
 
-There is no `cloudbuild.yaml` or `Dockerfile` provided. [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) takes care of everything without those files.
+You can also invoke Cloud Build buildpacks directly without [`v2/cloudbuild.yaml`](../../cloudbuild.yaml):
+```bash
+gcloud builds submit --async --pack \
+  image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match/soloduel,env=GOOGLE_BUILDABLE=./examples/mmf
+```
 
-When deploying a built MMF container image to Google Cloud Run, pass `--use-http2` so Cloud Run enables end-to-end HTTP/2 for gRPC streaming (and optionally set `--update-env-vars="MMF_FUNCTION=fifo"` or `"MMF_FUNCTION=debug"`).
+[`v2/cloudbuild.yaml`](../../cloudbuild.yaml) invokes [Google Cloud's buildpacks](https://cloud.google.com/docs/buildpacks/overview) (`gcr.io/k8s-skaffold/pack`), so no `Dockerfile` is required. This application can also be built locally with the [`pack`](https://buildpacks.io/docs/for-platform-operators/how-to/integrate-ci/pack/) or [`docker`](https://www.docker.com/) CLIs.
 
-This application can also be built with the [`pack`](https://buildpacks.io/docs/for-platform-operators/how-to/integrate-ci/pack/) or [`docker`](https://www.docker.com/) CLIs with a little effort.
+## Deploy
+
+The [`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml) file deploys the built MMF container image to Google Cloud Run:
+```bash
+cd <repo>/v2/examples/mmf/deploy
+gcloud builds submit --async --no-source --substitutions=COMMIT_SHA=latest
+```
+
+[`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml) configures the Cloud Run service with:
+* `--use-http2` so Cloud Run enables end-to-end HTTP/2 for gRPC streaming.
+* `--no-cpu-throttling --execution-environment=gen2` alongside the `opentelemetry-collector` sidecar container (`_OTEL_SIDECAR_IMAGE`).
+* `_MMF_FUNCTION` (`fifo` by default, or `debug`), `_JOB_NAME` (`soloduel` by default), and `_SERVICE_ACCOUNT` (`soloduel-identity` by default), allowing both the `fifo` and `debug` MMF services to be deployed from the same container image.
 
 ## MMF Best Practices
 This section describes best practices for an Open Match MMF.
@@ -44,7 +59,7 @@ A typical approach is to consider your matching logic in your MMF as a matching 
 > [!WARNING]
 > Be aware that OM2 makes no effort to prevent individual concurrent MMF invocations from returning matches containing the same ticket (ticket 'collision'). Your matchmaker should be coded to avoid or remediate collisions.
 
-* The Open Match Profile protobuf message containing Pools filled with Tickets may exceed the default protobuf message size limit of 4mb. OM respects this limit (as some middlewares do not support higher limits), and will 'chunk' these Profiles into multiple messages, streamed to your MMF. MMFs SHOULD read all streamed chunks sent to them by OM and concatinate all the Pools received in those 'chunks'. Every 'chunk' contains all of the data in the Profile *except* for the Profile's Pools, of which each 'chunk' gets a guaranteed-unique portion. This means your MMF MAY still perform matching even if it does not receive all 'chunks'.
+* The Open Match Profile protobuf message containing Pools filled with Tickets may exceed the default protobuf message size limit of 4mb. OM respects this limit (as some middlewares do not support higher limits), and will 'chunk' these Profiles into multiple messages, streamed to your MMF. MMFs SHOULD read all streamed chunks sent to them by OM and concatenate all the Pools received in those 'chunks'. Every 'chunk' contains all of the data in the Profile *except* for the Profile's Pools, of which each 'chunk' gets a guaranteed-unique portion. This means your MMF MAY still perform matching even if it does not receive all 'chunks'.
 * MMF matching logic (i.e. the Run() function) MUST eventually exit of its own accord. Open Match will never cancel your MMF invocation, exiting is your MMF's responsibility.
 * MMFs SHOULD stream back matches as they are made, when possible.
 
@@ -79,5 +94,5 @@ This section tries to list some common misconceptions and considerations that fr
   )
   ```
   The idea here is that the Matchmaker look at all these scores and the current state of your fleet(s) of game servers and intelligently decide which matches should be put on servers, and which should be discarded.
-* Typically, it is RECOMMENDED that an MMF is able to target a score threshold, and only return matches above that threshold. A common misconception is that an MMF must make as many matches as possible with the tickets it receives. In reality, it is often better to not make a match than to make a poor match - in a well-architected matchmaking approach, the tickets left behind will be considered by other concurrent matchmaking strategies or reconsidered in a future `InvokeMatchmakingFunctions` call, when more players have had had the opportunity to join the matchmaking pool.
+* Typically, it is RECOMMENDED that an MMF is able to target a score threshold, and only return matches above that threshold. A common misconception is that an MMF must make as many matches as possible with the tickets it receives. In reality, it is often better to not make a match than to make a poor match - in a well-architected matchmaking approach, the tickets left behind will be considered by other concurrent matchmaking strategies or reconsidered in a future `InvokeMatchmakingFunctions` call, when more players have had the opportunity to join the matchmaking pool.
 * If you want observability beyond the system-level metrics you get from the platform where your MMF runs, you MAY instrument your MMF, and have it output metrics to your observability suite. Open Match does not collect metrics from your MMFs on your behalf.
