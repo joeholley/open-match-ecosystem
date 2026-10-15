@@ -147,7 +147,11 @@ func main() {
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 
 	// Ticket creation config
-	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 3)
+	// Default MAX_CONCURRENT_TICKET_CREATIONS to 500 so high-TPC workloads can
+	// saturate om-core's outgoing replication batch threshold
+	// (OM_CACHE_OUT_MAX_QUEUE_THRESHOLD=100) without stalling behind its 250ms
+	// batch wait timer (OM_CACHE_OUT_WAIT_TIMEOUT_MS=250).
+	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 500)
 	cfg.SetDefault("INITIAL_TPC", 10)
 	cfg.SetDefault("TICKET_CREATION_CYCLE_DURATION_MS", 1000)
 	cfg.SetDefault("TICKET_CREATION_CYCLES", math.MaxInt32)
@@ -281,8 +285,8 @@ func main() {
 	q := &mmqueue.MatchmakerQueue{
 		OmClient: omclient.New(cfg, log, &http.Client{
 			Transport: &http.Transport{
-				MaxIdleConns:        100,              // Maximum idle connections to keep open
-				MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+				MaxIdleConns:        500,              // Maximum idle connections to keep open
+				MaxIdleConnsPerHost: 500,              // Maximum idle connections per host
 				IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
 				DisableKeepAlives:   false,            // Make sure keep-alives are enabled
 			},
