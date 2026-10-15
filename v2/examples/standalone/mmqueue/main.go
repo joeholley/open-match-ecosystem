@@ -61,11 +61,13 @@ package main
 
 import (
 	"context"
+	"math"
 	"net/http"
 	_ "net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -108,6 +110,12 @@ func main() {
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 20)
+	// Test ticket load generation config (defaults INITIAL_TPC to 0 in the
+	// standalone queue so synthetic tickets are only generated when opted into
+	// via INITIAL_TPC or the /tpc/{tixPerCycle} endpoint).
+	cfg.SetDefault("INITIAL_TPC", 0)
+	cfg.SetDefault("TICKET_CREATION_CYCLE_DURATION_MS", 1000)
+	cfg.SetDefault("TICKET_CREATION_CYCLES", math.MaxInt32)
 	cfg.SetDefault("PORT", 8081)
 
 	// Override these with env vars when doing local development.
@@ -178,9 +186,19 @@ func main() {
 		)
 	}
 
-	// Initialize the queue
+	// Initialize the queue with a pooled HTTP transport matching examples/matchmaker
+	// so concurrent CreateTicket and ActivateTickets requests reuse keep-alive
+	// connections under high ticket creation concurrency (MAX_CONCURRENT_TICKET_CREATIONS).
 	q := &mmqueue.MatchmakerQueue{
-		OmClient:           omclient.New(cfg, log, &http.Client{}),
+		OmClient: omclient.New(cfg, log, &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,              // Maximum idle connections to keep open
+				MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+				IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+				DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+			},
+			Timeout: 30 * time.Second,
+		}),
 		Cfg:                cfg,
 		Log:                log,
 		ClientRequestChan:  make(chan *mmqueue.ClientRequest),
@@ -200,35 +218,87 @@ func main() {
 	// Start the queue. This is where requests are processed and added to Open Match.
 	go q.Run(ctx)
 
-	// Handler for client matchmaking requests
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for client matchmaking requests (registered on both /tickets to
+	// match examples/matchmaker and / for backward compatibility).
+	handleTicketRequest := func(w http.ResponseWriter, r *http.Request) {
 
-		// Make a channel on which the queue will return its http.Status result
-		resultChan := make(chan int)
-		q.ClientRequestChan <- &mmqueue.ClientRequest{
+		// Make a buffered channel on which the queue will return its http.Status
+		// result so the queue worker never blocks if the HTTP caller disconnects early.
+		resultChan := make(chan int, 1)
+		req := &mmqueue.ClientRequest{
 			ResultChan: resultChan,
 			Ticket: func(r *http.Request) *pb.Ticket {
 				// In a real game client, you'd probably use whatever communication
 				// protocol/format (JSON string, binary encoding, a custom format,
 				// etc) your game engine or dev kit encourages, and parse that data
-				// from the http.Request into the Open Match protobuf `ticket`
+				// from the http.Request 'r' into the Open Match protobuf `ticket`
 				// protobuf here.
 				//
-				// This example just makes an empty ticket.
-				//
-				// This ticket can only appear in Pools with a single
-				// CreationTimeFilter, as they have no other attributes to
-				// match against (CreationTime is created by Open Match upon
-				// ticket creation).
-				ticket := &pb.Ticket{}
-				// TODO: remove this line once the test framework is trued up
-				ticket = gameclient.Simple(ctx)
-				return ticket
+				// This example uses the provided internal library to generate a simple
+				// ticket with a few example attributes for testing.
+
+				// TODO: replace the gameclient.Simple() call with your own code to
+				// process the request 'r' into an Open Match *pb.Ticket.
+				return gameclient.Simple(ctx)
 			}(r),
 		}
 
+		// Guard the enqueue on ctx.Done() and r.Context().Done() so in-flight HTTP
+		// requests do not block during graceful shutdown after q.Run(ctx) exits.
+		select {
+		case q.ClientRequestChan <- req:
+		case <-ctx.Done():
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+
 		// Write the http.Status code returned by the queue
-		w.WriteHeader(<-resultChan)
+		select {
+		case status := <-resultChan:
+			w.WriteHeader(status)
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+		}
+	}
+	http.HandleFunc("/tickets", handleTicketRequest)
+	http.HandleFunc("/", handleTicketRequest)
+
+	// FOR TESTING ONLY
+	// Asynchronous goroutine that loops TICKET_CREATION_CYCLES number of
+	// times, attempting to queue the given number of tickets each cycle.
+	// Update the tpc by sending an http GET to /tpc/<NUM> as per the handler
+	// below.
+	q.SetTestTicketConfig(cfg.GetInt64("INITIAL_TPC"), gameclient.Simple)
+	go q.GenerateTestTickets(ctx)
+
+	// Handler to update the (best effort) number of test tickets we want to
+	// generate and put into the queue per second. If the requested TPC is more
+	// than the matchmaker can manage in a second, it will do as many as it
+	// can. Set it to 0 to stop automatically creating tickets.
+	http.HandleFunc("/tpc/{tixPerCycle}", func(w http.ResponseWriter, r *http.Request) {
+
+		// Attempt to convert requested TPC string into an int64
+		rTPC, err := strconv.ParseInt(r.PathValue("tixPerCycle"), 10, 64)
+		if err != nil {
+			// Couldn't convert to int; maybe a typo in the http request?
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		// Reject negative values and enforce a hard cap of 10k per second to
+		// protect against mistyped http requests.
+		if rTPC < 0 || rTPC > 10000 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Update tixPerSec number, and generate tickets using the gameclient.Simple function.
+		q.SetTestTicketConfig(rTPC, gameclient.Simple)
+
+		logger.Infof("TPC set to %v", rTPC)
+		w.WriteHeader(http.StatusOK)
 	})
 
 	// Start http server.

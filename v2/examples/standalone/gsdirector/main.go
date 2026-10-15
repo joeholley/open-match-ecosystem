@@ -68,6 +68,10 @@ func main() {
 	cfg.SetDefault("PORT", "8090")
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
 	cfg.SetDefault("SOLODUEL_PORT", 50090)
+	// Optional DEBUG MMF endpoint config (disabled by default in standalone
+	// gsdirector unless DEBUGMMF_ADDR is explicitly configured).
+	cfg.SetDefault("DEBUGMMF_ADDR", "")
+	cfg.SetDefault("DEBUGMMF_PORT", 50081)
 
 	// OM core config that the matchmaker needs to respect.
 	// Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL (default 500), which
@@ -173,11 +177,29 @@ func main() {
 		)
 	}
 
-	// Initialize the director
+	// Initialize the director.
+	// Use a pooled HTTP transport for the director's OmClient so concurrent
+	// InvokeMatchmakingFunctions streams and ticket re-activation calls reuse
+	// keep-alive connections instead of falling back to Go's default 2 idle
+	// connections per host. Do NOT set a static 30s http.Client.Timeout here:
+	// InvokeMatchmakingFunctions is a server-streaming RPC whose lifetime is
+	// bounded server-side by om-core's OM_MMF_TIMEOUT_SECS and
+	// OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS, so a short static client timeout
+	// could sever valid long-running MMF streams mid-cycle.
+	// Also pass OtelMeterPtr to MockAgonesIntegration so game server allocation
+	// metrics are registered on the shared OpenTelemetry meter.
 	d := &gsdirector.MockDirector{
-		OmClient: omclient.New(cfg, log, &http.Client{}),
+		OmClient: omclient.New(cfg, log, &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,              // Maximum idle connections to keep open
+				MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+				IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+				DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+			},
+		}),
 		GSManager: &gsdirector.MockAgonesIntegration{
-			Log: log,
+			Log:          log,
+			OtelMeterPtr: meterptr,
 		},
 		Cfg:                 cfg,
 		Log:                 log,
@@ -185,16 +207,26 @@ func main() {
 		OtelMeterPtr:        meterptr,
 	}
 
-	// Apply configured MMF endpoint to the sample SoloDuel/HeroShooter game modes
-	// and re-serialize their backfill MmfRequest extensions before initializing GSManager.
+	// Apply configured MMF endpoint to the sample SoloDuel game mode and
+	// re-serialize its backfill MmfRequest extensions before initializing GSManager.
 	gsdirector.Fifo.Host = cfg.GetString("SOLODUEL_ADDR")
 	gsdirector.Fifo.Port = cfg.GetInt32("SOLODUEL_PORT")
+	if cfg.GetString("DEBUGMMF_ADDR") != "" {
+		gsdirector.SoloDuel.MMFs = append(gsdirector.SoloDuel.MMFs, &pb.MatchmakingFunctionSpec{
+			Name: "DEBUG",
+			Host: cfg.GetString("DEBUGMMF_ADDR"),
+			Port: cfg.GetInt32("DEBUGMMF_PORT"),
+			Type: pb.MatchmakingFunctionSpec_GRPC,
+		})
+	}
 	if err := gsdirector.SoloDuel.SetBackfillMMFs(gsdirector.Fifo); err != nil {
 		logger.Fatalf("Failed to configure SoloDuel backfill MMFs: %v", err)
 	}
-	if err := gsdirector.HeroShooter.SetBackfillMMFs(gsdirector.Fifo); err != nil {
-		logger.Fatalf("Failed to configure HeroShooter backfill MMFs: %v", err)
-	}
+	// HeroShooter is currently disabled in GameModesInZone because no sample
+	// BalancedTeam MMF implementation is provided yet (matching examples/matchmaker).
+	// if err := gsdirector.HeroShooter.SetBackfillMMFs(gsdirector.Fifo); err != nil {
+	// 	logger.Fatalf("Failed to configure HeroShooter backfill MMFs: %v", err)
+	// }
 
 	// In a real stand-alone director, you would read in your actual game server configuration and construct
 	// the FleetConfig, ZonePools, and GameModesInZone. For automated testing, we use the sample ones

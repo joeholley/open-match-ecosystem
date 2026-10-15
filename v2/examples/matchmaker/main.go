@@ -299,8 +299,23 @@ func main() {
 	}
 
 	// Initialize the director
+	// Use a pooled HTTP transport for the director's OmClient so concurrent
+	// InvokeMatchmakingFunctions streams and ticket re-activation calls reuse
+	// keep-alive connections instead of falling back to Go's default 2 idle
+	// connections per host. Do NOT set a static 30s http.Client.Timeout here:
+	// InvokeMatchmakingFunctions is a server-streaming RPC whose lifetime is
+	// bounded server-side by om-core's OM_MMF_TIMEOUT_SECS and
+	// OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS, so a short static client timeout
+	// could sever valid long-running MMF streams mid-cycle.
 	d := &gsdirector.MockDirector{
-		OmClient: omclient.New(cfg, log, &http.Client{}),
+		OmClient: omclient.New(cfg, log, &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,              // Maximum idle connections to keep open
+				MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+				IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+				DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+			},
+		}),
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log:          log,
 			OtelMeterPtr: meterptr,
@@ -364,12 +379,10 @@ func main() {
 	// Handler to manually insert 1 test ticket into the queue.
 	http.HandleFunc("/tickets", func(w http.ResponseWriter, r *http.Request) {
 
-		// Make a channel on which the queue will return its http.Status
-		// result.  In a real matchmaker, you need to keep this channel and
-		// process the status result in a way that makes sense to send back to
-		// your game client.
-		resultChan := make(chan int)
-		q.ClientRequestChan <- &mmqueue.ClientRequest{
+		// Make a buffered channel on which the queue will return its http.Status
+		// result so the queue worker never blocks if the HTTP caller disconnects early.
+		resultChan := make(chan int, 1)
+		req := &mmqueue.ClientRequest{
 			ResultChan: resultChan,
 			Ticket: func(r *http.Request) *pb.Ticket {
 				// In a real game client, you'd probably use whatever communication
@@ -387,8 +400,25 @@ func main() {
 			}(r),
 		}
 
+		// Guard the enqueue on ctx.Done() and r.Context().Done() so in-flight HTTP
+		// requests do not block during graceful shutdown after q.Run(ctx) exits.
+		select {
+		case q.ClientRequestChan <- req:
+		case <-ctx.Done():
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+
 		// Write the http.Status code returned by the queue
-		w.WriteHeader(<-resultChan)
+		select {
+		case status := <-resultChan:
+			w.WriteHeader(status)
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+		}
 	})
 
 	// FOR TESTING ONLY
@@ -412,8 +442,9 @@ func main() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		// Hard cap of 10k per second to protect against mistyped http requests
-		if rTPC > 10000 {
+		// Reject negative values and enforce a hard cap of 10k per second to
+		// protect against mistyped http requests.
+		if rTPC < 0 || rTPC > 10000 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
