@@ -43,8 +43,10 @@ var (
 		"component": "matchmaking_function",
 		"function":  "server",
 	}
-	log            = logrus.New()
-	logger         *logrus.Entry
+	log = logrus.New()
+	// Initialize logger at package declaration time so GetChunkedRequest can
+	// safely log even when invoked directly without calling StartServer first.
+	logger         = log.WithFields(logfields)
 	NoSuchKeyError = errors.New("Extension field contains no such key")
 )
 
@@ -96,8 +98,17 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 		logger.Debugf("Processing chunk %02d/%02d", i, in.GetNumChunks())
 		for name, pool := range in.GetProfile().GetPools() {
 			logger.Debugf("concatinating pool %v", name)
+			rosterName := pool.GetParticipants().GetName()
+			if rosterName == "" {
+				rosterName = name
+			}
 			if _, ok := pools[name]; !ok {
-				// First chunk containing this pool; initialize the local copy.
+				// First chunk containing this pool; initialize the local copy with
+				// a fresh non-nil Participants roster and a cloned Tickets slice.
+				// om-core preserves empty pools (0 matching tickets, where
+				// pool.GetParticipants() may be nil) across chunks, and cloning
+				// the initial Tickets slice ensures subsequent chunk appends never
+				// mutate the first chunk's underlying slice in place.
 				pools[name] = &pb.Pool{
 					Name:                    pool.GetName(),
 					TagPresentFilters:       pool.GetTagPresentFilters(),
@@ -105,10 +116,17 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 					DoubleRangeFilters:      pool.GetDoubleRangeFilters(),
 					CreationTimeRangeFilter: pool.GetCreationTimeRangeFilter(),
 					Extensions:              pool.GetExtensions(),
-					Participants:            pool.GetParticipants(),
+					Participants: &pb.Roster{
+						Name:    rosterName,
+						Tickets: append([]*pb.Ticket(nil), pool.GetParticipants().GetTickets()...),
+					},
 				}
 			} else {
-				// concate pools split amoung multiple chunks
+				// Concatenate pools split among multiple chunks, guarding against a
+				// nil Participants pointer if the pool was previously initialized empty.
+				if pools[name].Participants == nil {
+					pools[name].Participants = &pb.Roster{Name: rosterName}
+				}
 				pools[name].Participants.Tickets = append(pools[name].Participants.Tickets, pool.GetParticipants().GetTickets()...)
 			}
 		}

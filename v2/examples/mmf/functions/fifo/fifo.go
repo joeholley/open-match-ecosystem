@@ -106,22 +106,32 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	startTime := time.Now()
 
 	// Use the helper function to reconstruct the incoming request from partial
-	// 'chunked' requests.
+	// 'chunked' requests. If stream reception fails, abort immediately rather
+	// than proceeding with a nil profile.
 	req, err := server.GetChunkedRequest(stream)
 	if err != nil {
 		s.logger.Errorf("error getting chunked request: %v", err)
+		return err
 	}
 	s.logger.Infof("Generating matches for profile %v", req.GetName())
 
-	// Process tickets for the pools specified in the Match Profile.  In this
+	// Process tickets for the pools specified in the Match Profile. In this
 	// example fifo matching strategy, any player can be matched with any other
-	// player, so just concatinate all the pools together.
+	// player, so concatenate all the pools together while deduplicating tickets
+	// by ID so that a ticket matching multiple overlapping pools is only placed
+	// into a match once.
 	tickets := []*pb.Ticket{}
+	seenTickets := make(map[string]struct{})
 	for pname, pool := range req.GetPools() {
-		for _, ticket := range pool.GetParticipants().GetTickets() {
+		poolTickets := pool.GetParticipants().GetTickets()
+		for _, ticket := range poolTickets {
+			if _, seen := seenTickets[ticket.GetId()]; seen {
+				continue
+			}
+			seenTickets[ticket.GetId()] = struct{}{}
 			tickets = append(tickets, ticket)
 		}
-		s.logger.Debugf("Found %v tickets in pool %v", len(tickets), pname)
+		s.logger.Debugf("Found %v tickets in pool %v", len(poolTickets), pname)
 	}
 	s.logger.Debugf("Matching among %v tickets from %v provided pools", len(tickets), len(req.GetPools()))
 
@@ -235,8 +245,11 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 			match.Rosters[curRoster].Tickets = append(match.Rosters[curRoster].Tickets, tickets[0])
 			// ----------------------------------------------------------------
 
-			// Remove this ticket from the pool
+			// Remove this ticket from the pool and advance the ticket counter
+			// before checking whether all rosters have reached desiredRosterLen,
+			// so tixCount accurately reflects the final ticket added before break.
 			tickets = tickets[1:]
+			tixCount++
 
 			// Quit adding tickets if all rosters are full.
 			if !rosterLengthsLessThan(match, desiredRosterLen) {
@@ -248,9 +261,6 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 				score = 100
 				break
 			}
-
-			// rotate to the next roster for the next ticket
-			tixCount++
 		}
 
 		// Ran out of tickets before we met the desired roster length for all

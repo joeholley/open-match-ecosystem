@@ -96,10 +96,12 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	t := time.Now().Format("2006-01-02T15:04:05.00")
 
 	// Use the helper function to reconstruct the incoming request from partial
-	// 'chunked' requests.
+	// 'chunked' requests. If stream reception fails, abort immediately rather
+	// than logging a nil profile and streaming back an empty match.
 	req, err := server.GetChunkedRequest(stream)
 	if err != nil {
 		s.logger.Errorf("error getting chunked request: %v", err)
+		return err
 	}
 
 	// Print the name of the profile.
