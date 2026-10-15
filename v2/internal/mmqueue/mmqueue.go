@@ -235,8 +235,6 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		go func() {
 			defer resultsWg.Done()
 			for res := range activationResults {
-				otelActivationsPerCall.Record(ctx, 1)
-
 				pendingMu.Lock()
 				waiters := pendingActivations[res.TicketId]
 				delete(pendingActivations, res.TicketId)
@@ -252,6 +250,10 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 					}
 					continue
 				}
+
+				// Record otelTicketActivations only after confirming res.Err == nil
+				// so failed activations are counted solely under otelTicketActivationFailures.
+				otelTicketActivations.Add(ctx, 1)
 
 				for _, ch := range waiters {
 					ch <- http.StatusOK

@@ -30,6 +30,8 @@ import (
 	"github.com/spf13/viper"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -701,4 +703,165 @@ func TestGenerateTestTickets_ExitsImmediatelyOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for GenerateTestTickets to exit on ctx cancellation")
 	}
+}
+
+// TestMatchmakerQueueRun_TicketActivationMetricsCounterAndFailureSplit verifies
+// that MatchmakerQueue registers "mmqueue.ticket.activations" as a monotonic
+// Int64Counter (with description "Total number of tickets activated") rather
+// than a histogram, and increments it only when a ticket activation succeeds
+// while recording failed activations on "mmqueue.ticket.activations.failures".
+func TestMatchmakerQueueRun_TicketActivationMetricsCounterAndFailureSplit(t *testing.T) {
+	ticketIDs := []string{"ticket-ok-1", "ticket-fail-1", "ticket-ok-2"}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/tickets":
+			var createReq pb.CreateTicketRequest
+			if err := protojson.Unmarshal(body, &createReq); err != nil || len(createReq.GetTicket().GetAttributes().GetTags()) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			resp := &pb.CreateTicketResponse{TicketId: createReq.GetTicket().GetAttributes().GetTags()[0]}
+			b, _ := protojson.Marshal(resp)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
+		case "/tickets:activate":
+			var actReq pb.ActivateTicketsRequest
+			if err := protojson.Unmarshal(body, &actReq); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			hasFailTicket := false
+			for _, id := range actReq.GetTicketIds() {
+				if id == "ticket-fail-1" {
+					hasFailTicket = true
+					break
+				}
+			}
+			if !hasFailTicket {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+				return
+			}
+			// Return 400 InvalidArgument with a BadRequest FieldViolation for
+			// "ticket_id/ticket-fail-1" so any valid tickets in the batch
+			// succeed and "ticket-fail-1" fails permanently.
+			st := status.New(codes.InvalidArgument, "partial activation failure")
+			stWithDetails, err := st.WithDetails(&errdetails.BadRequest{
+				FieldViolations: []*errdetails.BadRequest_FieldViolation{
+					{Field: "ticket_id/ticket-fail-1", Description: "Invalid ticket id"},
+				},
+			})
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			b, _ := protojson.Marshal(stWithDetails.Proto())
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write(b)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
+	meter := mp.Meter("mmqueue-metrics-test")
+
+	q, assignmentsChan := newTestQueue(srv.URL, 5, 10)
+	q.OtelMeterPtr = &meter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		q.Run(ctx)
+	}()
+
+	resChans := make([]chan int, len(ticketIDs))
+	for i, tid := range ticketIDs {
+		resChans[i] = make(chan int, 1)
+		q.ClientRequestChan <- &ClientRequest{
+			Ticket: &pb.Ticket{
+				Attributes: &pb.Ticket_FilterableData{
+					Tags: []string{tid},
+				},
+			},
+			ResultChan: resChans[i],
+		}
+	}
+
+	wantStatuses := []int{http.StatusOK, http.StatusInternalServerError, http.StatusOK}
+	for i, wantStatus := range wantStatuses {
+		select {
+		case gotStatus := <-resChans[i]:
+			if gotStatus != wantStatus {
+				t.Fatalf("ticket %d (%s) status = %d, want %d", i, ticketIDs[i], gotStatus, wantStatus)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for ticket %d (%s) activation result", i, ticketIDs[i])
+		}
+	}
+
+	cancel()
+	close(assignmentsChan)
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for MatchmakerQueue.Run to exit")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	metricsByName := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricsByName[m.Name] = m
+		}
+	}
+
+	if _, deprecatedExists := metricsByName["mmqueue.ticket.activations.per_call"]; deprecatedExists {
+		t.Errorf("deprecated histogram metric mmqueue.ticket.activations.per_call should no longer be registered")
+	}
+
+	assertMonotonicCounterSum := func(name, wantDesc string, wantTotal int64) {
+		t.Helper()
+		m, ok := metricsByName[name]
+		if !ok {
+			t.Fatalf("expected metric %q to be registered and collected, got metrics: %v", name, metricsByName)
+		}
+		if wantDesc != "" && m.Description != wantDesc {
+			t.Errorf("metric %q Description = %q, want %q", name, m.Description, wantDesc)
+		}
+		sumData, ok := m.Data.(metricdata.Sum[int64])
+		if !ok {
+			t.Fatalf("metric %q Data type = %T, want metricdata.Sum[int64] (Int64Counter)", name, m.Data)
+		}
+		if !sumData.IsMonotonic {
+			t.Errorf("metric %q Sum.IsMonotonic = false, want true", name)
+		}
+		var total int64
+		for _, dp := range sumData.DataPoints {
+			total += dp.Value
+		}
+		if total != wantTotal {
+			t.Errorf("metric %q total counter value = %d, want %d", name, total, wantTotal)
+		}
+	}
+
+	// 3 tickets were created; 2 activations succeeded and 1 activation failed.
+	assertMonotonicCounterSum("mmqueue.ticket.creations", "Total tickets created since startup", 3)
+	assertMonotonicCounterSum("mmqueue.ticket.activations", "Total number of tickets activated", 2)
+	assertMonotonicCounterSum("mmqueue.ticket.activations.failures", "Total number of ticket activations that permanently failed", 1)
 }

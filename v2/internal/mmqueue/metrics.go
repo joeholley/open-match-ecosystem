@@ -30,6 +30,7 @@ var (
 	// Metric variable declarations are global, so they can be accessed directly in the application code.
 	// Metrics populated by the grpc function implementations in main.go.
 	otelTicketAssignments                 otelmetrics.Int64Counter
+	otelTicketActivations                 otelmetrics.Int64Counter
 	otelTicketActivationFailures          otelmetrics.Int64Counter
 	otelTicketCreationRetries             otelmetrics.Int64Counter
 	otelTicketCreations                   otelmetrics.Int64Counter
@@ -37,7 +38,6 @@ var (
 	otelTicketsGeneratedPerCycle          otelmetrics.Int64ObservableGauge
 	otelTicketGenerationsAchievedPerCycle otelmetrics.Int64Histogram
 	otelTicketGenerationCycleDurations    otelmetrics.Int64Histogram
-	otelActivationsPerCall                otelmetrics.Int64Histogram
 	otelTicketQueuedDurations             otelmetrics.Float64Histogram
 )
 
@@ -64,9 +64,14 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelActivationsPerCall, err = meter.Int64Histogram(
-		metricsNamePrefix+"ticket.activation.requests",
-		otelmetrics.WithDescription("Total tickets set to active, so they appear in pools"),
+	// Use a monotonic Int64Counter (paired with mmqueue.ticket.activations.failures)
+	// rather than an Int64Histogram because omclient.ActivateTicketsWithResults
+	// handles batching internally and streams one per-ticket ActivationResult
+	// back to mmqueue (where recording 1 into a histogram would produce a
+	// degenerate distribution with min=1, max=1, mean=1).
+	otelTicketActivations, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.activations",
+		otelmetrics.WithDescription("Total number of tickets activated"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
