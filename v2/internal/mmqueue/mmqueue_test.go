@@ -865,3 +865,219 @@ func TestMatchmakerQueueRun_TicketActivationMetricsCounterAndFailureSplit(t *tes
 	assertMonotonicCounterSum("mmqueue.ticket.activations", "Total number of tickets activated", 2)
 	assertMonotonicCounterSum("mmqueue.ticket.activations.failures", "Total number of ticket activations that permanently failed", 1)
 }
+
+// TestMatchmakerQueueRun_AssignmentDeliveryAndMetrics verifies that the
+// AssignmentReceiver.Receive goroutine in MatchmakerQueue.Run (mmqueue.go:302-355):
+//  1. Removes tracked tickets ("ticket-assign-1", "ticket-assign-2") from
+//     q.Tickets upon receiving an assignment Roster, records each successful
+//     assignment on the monotonic Int64Counter "mmqueue.ticket.assignments",
+//     and records each ticket's elapsed queue duration on the Float64Histogram
+//     "mmqueue.ticket.queued_durations".
+//  2. Increments the monotonic Int64Counter "mmqueue.ticket.deletion.failures"
+//     when receiving a subsequent Roster containing an already-assigned ticket
+//     ("ticket-assign-1") and an untracked ticket ("ticket-untracked-99").
+func TestMatchmakerQueueRun_AssignmentDeliveryAndMetrics(t *testing.T) {
+	trackedTicketIDs := []string{"ticket-assign-1", "ticket-assign-2"}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/tickets":
+			var createReq pb.CreateTicketRequest
+			if err := protojson.Unmarshal(body, &createReq); err != nil || len(createReq.GetTicket().GetAttributes().GetTags()) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			resp := &pb.CreateTicketResponse{TicketId: createReq.GetTicket().GetAttributes().GetTags()[0]}
+			b, _ := protojson.Marshal(resp)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
+		case "/tickets:activate":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
+	meter := mp.Meter("mmqueue-assignment-metrics-test")
+
+	q, assignmentsChan := newTestQueue(srv.URL, 5, 1)
+	q.OtelMeterPtr = &meter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		q.Run(ctx)
+	}()
+
+	// 1. Enqueue and activate 2 tickets ("ticket-assign-1", "ticket-assign-2")
+	// through q.ClientRequestChan so they are stored in q.Tickets.
+	resChans := make([]chan int, len(trackedTicketIDs))
+	for i, tid := range trackedTicketIDs {
+		resChans[i] = make(chan int, 1)
+		q.ClientRequestChan <- &ClientRequest{
+			Ticket: &pb.Ticket{
+				Attributes: &pb.Ticket_FilterableData{
+					Tags:         []string{tid},
+					CreationTime: timestamppb.New(time.Now().Add(-50 * time.Millisecond)),
+				},
+			},
+			ResultChan: resChans[i],
+		}
+	}
+
+	for i, tid := range trackedTicketIDs {
+		select {
+		case gotStatus := <-resChans[i]:
+			if gotStatus != http.StatusOK {
+				t.Fatalf("ticket %s status = %d, want %d (http.StatusOK)", tid, gotStatus, http.StatusOK)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for ticket %s activation", tid)
+		}
+		if _, exists := q.Tickets.Load(tid); !exists {
+			t.Fatalf("expected ticket %s to be stored in q.Tickets after activation", tid)
+		}
+	}
+
+	// 2. Deliver an assignment Roster for the 2 tracked tickets with CreationTime
+	// populated, followed by a second Roster containing a duplicate already-assigned
+	// ticket ("ticket-assign-1") and an untracked ticket ("ticket-untracked-99").
+	assignmentsChan <- &pb.Roster{
+		Name:       "roster-valid-assignments",
+		Assignment: &pb.Assignment{Connection: "10.0.0.1:7777"},
+		Tickets: []*pb.Ticket{
+			{
+				Id: "ticket-assign-1",
+				Attributes: &pb.Ticket_FilterableData{
+					CreationTime: timestamppb.New(time.Now().Add(-60 * time.Millisecond)),
+				},
+			},
+			{
+				Id: "ticket-assign-2",
+				Attributes: &pb.Ticket_FilterableData{
+					CreationTime: timestamppb.New(time.Now().Add(-80 * time.Millisecond)),
+				},
+			},
+		},
+	}
+
+	assignmentsChan <- &pb.Roster{
+		Name:       "roster-duplicate-and-untracked",
+		Assignment: &pb.Assignment{Connection: "10.0.0.1:7777"},
+		Tickets: []*pb.Ticket{
+			{
+				Id: "ticket-assign-1",
+				Attributes: &pb.Ticket_FilterableData{
+					CreationTime: timestamppb.Now(),
+				},
+			},
+			{
+				Id: "ticket-untracked-99",
+				Attributes: &pb.Ticket_FilterableData{
+					CreationTime: timestamppb.Now(),
+				},
+			},
+		},
+	}
+
+	// Close assignmentsChan before cancelling ctx so syncChannelReceiver drains
+	// both rosters in order and returns cleanly, then cancel ctx to stop Run().
+	close(assignmentsChan)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(assignmentsChan) > 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for MatchmakerQueue.Run to exit")
+	}
+
+	// 3. Verify both tracked tickets were removed from q.Tickets.
+	for _, tid := range trackedTicketIDs {
+		if _, exists := q.Tickets.Load(tid); exists {
+			t.Errorf("expected ticket %s to be removed from q.Tickets after assignment delivery", tid)
+		}
+	}
+
+	// 4. Collect and verify OpenTelemetry metrics from ManualReader.
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	metricsByName := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricsByName[m.Name] = m
+		}
+	}
+
+	assertCounter := func(name, wantDesc string, wantTotal int64) {
+		t.Helper()
+		m, ok := metricsByName[name]
+		if !ok {
+			t.Fatalf("expected metric %q to be registered and collected, got: %v", name, metricsByName)
+		}
+		if wantDesc != "" && m.Description != wantDesc {
+			t.Errorf("metric %q Description = %q, want %q", name, m.Description, wantDesc)
+		}
+		sumData, ok := m.Data.(metricdata.Sum[int64])
+		if !ok {
+			t.Fatalf("metric %q Data type = %T, want metricdata.Sum[int64]", name, m.Data)
+		}
+		if !sumData.IsMonotonic {
+			t.Errorf("metric %q Sum.IsMonotonic = false, want true", name)
+		}
+		var total int64
+		for _, dp := range sumData.DataPoints {
+			total += dp.Value
+		}
+		if total != wantTotal {
+			t.Errorf("metric %q total value = %d, want %d", name, total, wantTotal)
+		}
+	}
+
+	// Verify 2 successful assignments and 2 deletion failures (1 duplicate + 1 untracked).
+	assertCounter("mmqueue.ticket.assignments", "Total ticket assignments received", 2)
+	assertCounter("mmqueue.ticket.deletion.failures", "Total ticket deletion failures", 2)
+
+	// Verify "mmqueue.ticket.queued_durations" recorded 2 observations.
+	queuedDurMetric, ok := metricsByName["mmqueue.ticket.queued_durations"]
+	if !ok {
+		t.Fatalf("expected metric \"mmqueue.ticket.queued_durations\" to be registered and collected, got: %v", metricsByName)
+	}
+	if wantDesc := "Length of time spent by tickets in the queue"; queuedDurMetric.Description != wantDesc {
+		t.Errorf("mmqueue.ticket.queued_durations Description = %q, want %q", queuedDurMetric.Description, wantDesc)
+	}
+	queuedHist, ok := queuedDurMetric.Data.(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("mmqueue.ticket.queued_durations Data type = %T, want metricdata.Histogram[float64]", queuedDurMetric.Data)
+	}
+	var totalCount uint64
+	var totalSum float64
+	for _, dp := range queuedHist.DataPoints {
+		totalCount += dp.Count
+		totalSum += dp.Sum
+	}
+	if totalCount != 2 {
+		t.Errorf("mmqueue.ticket.queued_durations Count = %d, want 2", totalCount)
+	}
+	if totalSum <= 0 {
+		t.Errorf("mmqueue.ticket.queued_durations Sum = %v, want > 0", totalSum)
+	}
+}

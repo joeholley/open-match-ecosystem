@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1175,4 +1177,308 @@ func TestMockDirectorRun_MetricsNamesDescriptionsAndRecording(t *testing.T) {
 	if totalCount != 1 || totalSum != 2 {
 		t.Errorf("matchmaking_cycle.match.proposals histogram (Count, Sum) = (%d, %d), want (1, 2)", totalCount, totalSum)
 	}
+}
+
+// TestMockDirectorRun_SameCycleAndCrossCycleCollisionRejectionAndReactivation
+// verifies MockDirector.Run's ticket collision and re-activation guarantees
+// (gsdirector.go:1343-1519):
+//  1. Same-Cycle Overlap (acceptedInCycle + backfill priority sorting):
+//     When "/matches:fetch" returns a standard fleet proposal ("match-fleet-overlap",
+//     profileName "fleet.soloduel", tickets ["t-shared", "t-fleet-unclaimed"])
+//     first and a backfill proposal ("match-backfill-winner", profileName
+//     "backfill.soloduel", tickets ["t-shared", "t-backfill-partner"]) second
+//     in the same cycle, sort.SliceStable prioritizes "backfill.soloduel" ahead
+//     of "fleet.soloduel". "match-backfill-winner" is accepted and allocated,
+//     while "match-fleet-overlap" is rejected via acceptedInCycle, sending only
+//     "t-fleet-unclaimed" (and never "t-shared" or "t-backfill-partner") to
+//     "/tickets:activate".
+//  2. Cross-Cycle Collision (assignments):
+//     On the subsequent cycle after "match-backfill-winner" has been allocated
+//     (so "t-shared" is recorded in assignments), a proposal
+//     ("match-cross-cycle-collision", profileName "fleet.soloduel", tickets
+//     ["t-shared", "t-cross-cycle-unclaimed"]) is rejected via assignments,
+//     never allocated, sends only "t-cross-cycle-unclaimed" (and never
+//     "t-shared" or "t-backfill-partner") to "/tickets:activate", and records
+//     the cross-cycle collision on "gsdirector.matchmaking_cycle.match.rejections.assigned"
+//     and "gsdirector.ticket.rejections.assigned".
+func TestMockDirectorRun_SameCycleAndCrossCycleCollisionRejectionAndReactivation(t *testing.T) {
+	// Seed the package-level math/rand generator used by the 2% simulated random
+	// rejection in ProposalsLoop (gsdirector.go:1416) so that the first proposals
+	// evaluated are deterministically not rejected by the random test check, while
+	// the test server state machine below also re-streams proposals if needed.
+	rand.Seed(1) //nolint:staticcheck // gsdirector.go uses top-level math/rand.Intn
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	const (
+		testReqHash         = "hash-collision-fleet"
+		baseAllocSpec       = `{"spec":"collision-fleet"}`
+		fleetOverlapID      = "match-fleet-overlap"
+		backfillWinnerID    = "match-backfill-winner"
+		crossCycleCollideID = "match-cross-cycle-collision"
+	)
+
+	hashAny, err := anypb.New(&knownpb.StringValue{Value: testReqHash})
+	if err != nil {
+		t.Fatalf("anypb.New(hash): %v", err)
+	}
+	allocAny, err := anypb.New(&knownpb.StringValue{Value: baseAllocSpec})
+	if err != nil {
+		t.Fatalf("anypb.New(alloc): %v", err)
+	}
+	fleetProfileAny, err := anypb.New(&knownpb.StringValue{Value: "fleet.soloduel"})
+	if err != nil {
+		t.Fatalf("anypb.New(fleetProfile): %v", err)
+	}
+	backfillProfileAny, err := anypb.New(&knownpb.StringValue{Value: "backfill.soloduel"})
+	if err != nil {
+		t.Fatalf("anypb.New(backfillProfile): %v", err)
+	}
+
+	gsMgr := &trackingGSManager{
+		requests: []*pb.MmfRequest{
+			{
+				Mmfs: []*pb.MatchmakingFunctionSpec{Fifo},
+				Profile: &pb.Profile{
+					Name: "fleet.soloduel.1",
+					Extensions: map[string]*anypb.Any{
+						ex.MMFRequestHashKey: hashAny,
+						ex.AgonesAllocatorKey: allocAny,
+					},
+				},
+			},
+		},
+		allocatedMatches: make(map[string]string),
+		updatedSpecs:     make(map[string]*pb.MmfRequest),
+	}
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
+	meter := mp.Meter("gsdirector-collision-metrics-test")
+
+	var (
+		mu             sync.Mutex
+		reactivatedIDs []string
+	)
+	hasAssignedRejectionRecorded := func() bool {
+		var rm metricdata.ResourceMetrics
+		if cErr := reader.Collect(ctx, &rm); cErr != nil {
+			return false
+		}
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name == "gsdirector.matchmaking_cycle.match.rejections.assigned" {
+					if hist, ok := m.Data.(metricdata.Histogram[int64]); ok {
+						var sum int64
+						for _, dp := range hist.DataPoints {
+							sum += dp.Sum
+						}
+						return sum >= 1
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tickets:activate":
+			body, _ := io.ReadAll(r.Body)
+			var reqPb pb.ActivateTicketsRequest
+			_ = protojson.Unmarshal(body, &reqPb)
+			mu.Lock()
+			reactivatedIDs = append(reactivatedIDs, reqPb.GetTicketIds()...)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+
+		case "/matches:fetch":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+
+			var toStream []*pb.Match
+			if !gsMgr.isAllocated(backfillWinnerID) {
+				// Phase 1 (Same-Cycle Overlap): Stream Proposal A ("fleet.soloduel")
+				// first and Proposal B ("backfill.soloduel") second in the same
+				// cycle. sort.SliceStable must move Proposal B ahead of Proposal A
+				// so Proposal B wins "t-shared" and Proposal A is rejected via
+				// acceptedInCycle. Re-stream on the next cycle if the 2% random
+				// rejection fired before Proposal B was allocated.
+				toStream = []*pb.Match{
+					{
+						Id: fleetOverlapID,
+						Rosters: map[string]*pb.Roster{
+							"r1": {
+								Tickets: []*pb.Ticket{
+									{Id: "t-shared"},
+									{Id: "t-fleet-unclaimed"},
+								},
+							},
+						},
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: hashAny,
+							"profileName":        fleetProfileAny,
+						},
+					},
+					{
+						Id: backfillWinnerID,
+						Rosters: map[string]*pb.Roster{
+							"r1": {
+								Tickets: []*pb.Ticket{
+									{Id: "t-shared"},
+									{Id: "t-backfill-partner"},
+								},
+							},
+						},
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: hashAny,
+							"profileName":        backfillProfileAny,
+						},
+					},
+				}
+			} else if !hasAssignedRejectionRecorded() {
+				// Phase 2 (Cross-Cycle Collision): "match-backfill-winner" has
+				// been allocated in a prior cycle, so "t-shared" is now in
+				// assignments. Stream Proposal C sharing "t-shared" along with
+				// "t-cross-cycle-unclaimed" until the cross-cycle assigned
+				// rejection metric is recorded.
+				toStream = []*pb.Match{
+					{
+						Id: crossCycleCollideID,
+						Rosters: map[string]*pb.Roster{
+							"r1": {
+								Tickets: []*pb.Ticket{
+									{Id: "t-shared"},
+									{Id: "t-cross-cycle-unclaimed"},
+								},
+							},
+						},
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: hashAny,
+							"profileName":        fleetProfileAny,
+						},
+					},
+				}
+			}
+			// Phase 3: Once both phases have completed, stream an empty response
+			// so NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=1 exits Run().
+
+			for _, m := range toStream {
+				raw, mErr := protojson.Marshal(&pb.StreamedMmfResponse{Match: m})
+				if mErr != nil {
+					t.Errorf("protojson.Marshal(StreamedMmfResponse): %v", mErr)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(raw))
+			}
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := viper.New()
+	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("NUM_MM_CYCLES", 50)
+	cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 1)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 0)
+	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+	// Use batch size 1 so each rejected unclaimed ticket is sent immediately to
+	// /tickets:activate within the cycle it is rejected.
+	cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	sender := &recordingAssignmentSender{}
+	d := &MockDirector{
+		OmClient:            omclient.New(cfg, log, srv.Client()),
+		GSManager:           gsMgr,
+		AssignmentPublisher: sender,
+		Cfg:                 cfg,
+		Log:                 log,
+		OtelMeterPtr:        &meter,
+	}
+
+	d.Run(ctx)
+
+	// 1. Verify match allocations: only "match-backfill-winner" was allocated;
+	// neither the same-cycle overlapping fleet proposal nor the cross-cycle
+	// colliding proposal was ever allocated.
+	if !gsMgr.isAllocated(backfillWinnerID) {
+		t.Errorf("expected backfill proposal %q to be prioritized and allocated", backfillWinnerID)
+	}
+	if gsMgr.isAllocated(fleetOverlapID) {
+		t.Errorf("expected overlapping standard fleet proposal %q to be rejected via acceptedInCycle, not allocated", fleetOverlapID)
+	}
+	if gsMgr.isAllocated(crossCycleCollideID) {
+		t.Errorf("expected cross-cycle colliding proposal %q to be rejected via assignments, not allocated", crossCycleCollideID)
+	}
+
+	// 2. Verify ticket re-activations sent to /tickets:activate:
+	// - "t-fleet-unclaimed" (from same-cycle rejection of Proposal A) and
+	//   "t-cross-cycle-unclaimed" (from cross-cycle rejection of Proposal C)
+	//   MUST be re-activated.
+	// - "t-shared" and "t-backfill-partner" (already assigned in Proposal B)
+	//   MUST NEVER be sent to /tickets:activate in any cycle.
+	mu.Lock()
+	gotReactivated := slices.Clone(reactivatedIDs)
+	mu.Unlock()
+
+	if !slices.Contains(gotReactivated, "t-fleet-unclaimed") {
+		t.Errorf("expected unclaimed ticket \"t-fleet-unclaimed\" from rejected same-cycle proposal to be re-activated, got %v", gotReactivated)
+	}
+	if !slices.Contains(gotReactivated, "t-cross-cycle-unclaimed") {
+		t.Errorf("expected unclaimed ticket \"t-cross-cycle-unclaimed\" from rejected cross-cycle proposal to be re-activated, got %v", gotReactivated)
+	}
+	for _, assignedTicketID := range []string{"t-shared", "t-backfill-partner"} {
+		if slices.Contains(gotReactivated, assignedTicketID) {
+			t.Errorf("already-assigned ticket %q must NEVER be re-activated via /tickets:activate, got %v", assignedTicketID, gotReactivated)
+		}
+	}
+
+	// 3. Verify OpenTelemetry metrics record the cross-cycle collision on
+	// "gsdirector.matchmaking_cycle.match.rejections.assigned" and
+	// "gsdirector.ticket.rejections.assigned" (Sum >= 1).
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	metricsByName := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricsByName[m.Name] = m
+		}
+	}
+
+	assertHistSumAtLeast := func(name string, minSum int64) {
+		t.Helper()
+		m, ok := metricsByName[name]
+		if !ok {
+			t.Fatalf("expected metric %q to be registered and collected, got: %v", name, metricsByName)
+		}
+		hist, ok := m.Data.(metricdata.Histogram[int64])
+		if !ok {
+			t.Fatalf("metric %q Data type = %T, want metricdata.Histogram[int64]", name, m.Data)
+		}
+		var sum int64
+		for _, dp := range hist.DataPoints {
+			sum += dp.Sum
+		}
+		if sum < minSum {
+			t.Errorf("metric %q histogram Sum = %d, want >= %d", name, sum, minSum)
+		}
+	}
+
+	assertHistSumAtLeast("gsdirector.matchmaking_cycle.match.rejections.assigned", 1)
+	assertHistSumAtLeast("gsdirector.ticket.rejections.assigned", 1)
+	assertHistSumAtLeast("gsdirector.matchmaking_cycle.match.rejections", 2)
 }
