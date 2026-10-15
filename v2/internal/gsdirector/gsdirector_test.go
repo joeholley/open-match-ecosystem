@@ -31,6 +31,8 @@ import (
 	"github.com/spf13/viper"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -1010,5 +1012,167 @@ func TestMockDirectorStatus_PopulatedAndConcurrencySafe(t *testing.T) {
 	if !strings.Contains(gotStatus, "director mmf invocation cycle 0000000005/0000000006") {
 		t.Errorf("d.Status() after 5 cycles = %q, want substring %q",
 			gotStatus, "director mmf invocation cycle 0000000005/0000000006")
+	}
+}
+
+// TestMockDirectorRun_MetricsNamesDescriptionsAndRecording verifies that
+// registerMetrics and MockDirector.Run register:
+//  1. "gsdirector.mmf.response.failures" (fixing the "reponse" typo) as a
+//     monotonic Int64Counter with description "Total MMF response stream errors".
+//  2. "gsdirector.matchmaking_cycle.match.proposals" as an Int64Histogram with
+//     description "Number of match proposals received from Matchmaking Functions"
+//     (replacing the copy-pasted active tickets description) and records the
+//     per-cycle proposed match count.
+func TestMockDirectorRun_MetricsNamesDescriptionsAndRecording(t *testing.T) {
+	reqHash := "fleet-metrics-hash"
+	hashAny, err := anypb.New(knownpb.String(reqHash))
+	if err != nil {
+		t.Fatalf("anypb.New(reqHash): %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matches:fetch":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			for _, matchID := range []string{"match-prop-1", "match-prop-2"} {
+				resp := &pb.StreamedMmfResponse{
+					Match: &pb.Match{
+						Id: matchID,
+						Rosters: map[string]*pb.Roster{
+							"all": {
+								Name:    "all",
+								Tickets: []*pb.Ticket{{Id: "t-" + matchID}},
+							},
+						},
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: hashAny,
+						},
+					},
+				}
+				b, _ := protojson.Marshal(resp)
+				_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(b))
+			}
+		case "/tickets:activate":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
+	meter := mp.Meter("gsdirector-metrics-test")
+
+	cfg := viper.New()
+	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("NUM_MM_CYCLES", 1)
+	cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 0)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 0)
+	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+	cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	gsMgr := &stubGSManager{
+		requests: []*pb.MmfRequest{
+			{
+				Profile: &pb.Profile{
+					Name: "fleet.soloduel.metrics",
+					Extensions: map[string]*anypb.Any{
+						ex.MMFRequestHashKey: hashAny,
+					},
+				},
+				Mmfs: []*pb.MatchmakingFunctionSpec{
+					{Name: "fifo", Host: "127.0.0.1", Port: 50051, Type: pb.MatchmakingFunctionSpec_REST},
+				},
+			},
+		},
+	}
+
+	d := &MockDirector{
+		OmClient:     omclient.New(cfg, log, srv.Client()),
+		GSManager:    gsMgr,
+		Cfg:          cfg,
+		Log:          log,
+		OtelMeterPtr: &meter,
+	}
+
+	ctx := context.Background()
+	d.Run(ctx)
+
+	// Record one MMF response stream failure on the initialized counter to
+	// verify its exported data points under the corrected metric name.
+	otelMMFResponseFailures.Add(ctx, 1)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	metricsByName := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricsByName[m.Name] = m
+		}
+	}
+
+	// 1. Verify the misspelled metric name does not exist.
+	if _, typoExists := metricsByName["gsdirector.mmf.reponse.failures"]; typoExists {
+		t.Errorf("misspelled metric \"gsdirector.mmf.reponse.failures\" should not be registered")
+	}
+
+	// 2. Verify "gsdirector.mmf.response.failures" is a monotonic Int64Counter
+	// with the expected description and recorded count.
+	mmfFailMetric, ok := metricsByName["gsdirector.mmf.response.failures"]
+	if !ok {
+		t.Fatalf("expected metric \"gsdirector.mmf.response.failures\" to be registered, got: %v", metricsByName)
+	}
+	if wantDesc := "Total MMF response stream errors"; mmfFailMetric.Description != wantDesc {
+		t.Errorf("mmf.response.failures Description = %q, want %q", mmfFailMetric.Description, wantDesc)
+	}
+	mmfFailSum, ok := mmfFailMetric.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("mmf.response.failures Data type = %T, want metricdata.Sum[int64]", mmfFailMetric.Data)
+	}
+	if !mmfFailSum.IsMonotonic {
+		t.Errorf("mmf.response.failures Sum.IsMonotonic = false, want true")
+	}
+	var totalFailures int64
+	for _, dp := range mmfFailSum.DataPoints {
+		totalFailures += dp.Value
+	}
+	if totalFailures != 1 {
+		t.Errorf("mmf.response.failures total value = %d, want 1", totalFailures)
+	}
+
+	// 3. Verify "gsdirector.matchmaking_cycle.match.proposals" is an Int64Histogram
+	// with the updated description and recorded the 2 match proposals in the cycle.
+	proposalsMetric, ok := metricsByName["gsdirector.matchmaking_cycle.match.proposals"]
+	if !ok {
+		t.Fatalf("expected metric \"gsdirector.matchmaking_cycle.match.proposals\" to be registered, got: %v", metricsByName)
+	}
+	if wantDesc := "Number of match proposals received from Matchmaking Functions"; proposalsMetric.Description != wantDesc {
+		t.Errorf("matchmaking_cycle.match.proposals Description = %q, want %q", proposalsMetric.Description, wantDesc)
+	}
+	proposalsHist, ok := proposalsMetric.Data.(metricdata.Histogram[int64])
+	if !ok {
+		t.Fatalf("matchmaking_cycle.match.proposals Data type = %T, want metricdata.Histogram[int64]", proposalsMetric.Data)
+	}
+	var totalCount uint64
+	var totalSum int64
+	for _, dp := range proposalsHist.DataPoints {
+		totalCount += dp.Count
+		totalSum += dp.Sum
+	}
+	if totalCount != 1 || totalSum != 2 {
+		t.Errorf("matchmaking_cycle.match.proposals histogram (Count, Sum) = (%d, %d), want (1, 2)", totalCount, totalSum)
 	}
 }

@@ -1194,7 +1194,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 		// Launch asynchronous match result processing function.
 		//
-		// We make a separate reponse channel for every InvokeMMF call - see
+		// We make a separate response channel for every InvokeMMF call - see
 		// the 'rClient.InvokeMatchmakingFunctions()' call below.  Each of
 		// those channels is sent to this match result processing goroutine on
 		// the 'fanInChan' channel (it is a channel-of-channels). This allows

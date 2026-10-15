@@ -51,8 +51,10 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	var err error
 
 	// Initialize all declared Metrics
+	// Count cumulative MMF response stream errors observed during
+	// InvokeMatchmakingFunctions calls.
 	otelMMFResponseFailures, err = meter.Int64Counter(
-		metricsNamePrefix+"mmf.reponse.failures",
+		metricsNamePrefix+"mmf.response.failures",
 		otelmetrics.WithDescription("Total MMF response stream errors"),
 	)
 	if err != nil {
@@ -139,9 +141,11 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
+	// Record the total number of match proposals returned across all MMFs in
+	// each matchmaking cycle before director validation and server allocation.
 	otelMatchesProposedPerCycle, err = meter.Int64Histogram(
 		metricsNamePrefix+"matchmaking_cycle.match.proposals",
-		otelmetrics.WithDescription("Total tickets set to active, so they appear in pools"),
+		otelmetrics.WithDescription("Number of match proposals received from Matchmaking Functions"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
