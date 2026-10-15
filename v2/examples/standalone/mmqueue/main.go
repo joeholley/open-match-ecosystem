@@ -115,7 +115,9 @@ func main() {
 	cfg.SetDefault("INITIAL_TPC", 0)
 	cfg.SetDefault("TICKET_CREATION_CYCLE_DURATION_MS", 1000)
 	cfg.SetDefault("TICKET_CREATION_CYCLES", math.MaxInt32)
-	cfg.SetDefault("PORT", 8081)
+	// Default HTTP port is 8080 (matching Cloud Run and GKE container conventions);
+	// override via PORT env var when running multiple services locally on one host.
+	cfg.SetDefault("PORT", 8080)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",

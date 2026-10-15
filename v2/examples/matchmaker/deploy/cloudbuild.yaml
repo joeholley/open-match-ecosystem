@@ -1,4 +1,8 @@
-# To use this cloudbuild.yaml from it's directory:
+# First, build and push the container image from the v2/ module root using v2/cloudbuild.yaml:
+#   gcloud builds submit --async \
+#     --substitutions=COMMIT_SHA=<CONTAINER_IMAGE_TAG_TO_DEPLOY>,_JOB_NAME=matchmaker-example,_GOOGLE_BUILDABLE=./examples/matchmaker
+#
+# Then, to deploy using this cloudbuild.yaml from its directory:
 #   gcloud builds submit --async --no-source \
 #     --substitutions=COMMIT_SHA=<CONTAINER_IMAGE_TAG_TO_DEPLOY>
 #
@@ -46,9 +50,12 @@ steps:
       - --region
       - ${_RUN_REGION}
       # The example matchmaker runs continuous background matchmaking loops
-      # (mmqueue.Run and gsdirector.Run) with in-memory ticket/assignment state,
-      # so it should run as an always-on, non-throttled singleton by default.
+      # (mmqueue.Run and gsdirector.Run) with in-memory ticket/assignment state
+      # and an OpenTelemetry Collector sidecar container, so it requires
+      # --no-cpu-throttling, --execution-environment=gen2, and a singleton
+      # instance by default.
       - --no-cpu-throttling
+      - --execution-environment=gen2
       - --min-instances=1
       - --max-instances=1
 

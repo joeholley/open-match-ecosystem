@@ -133,7 +133,9 @@ func main() {
 
 	// Read config
 	cfg := viper.New()
-	cfg.SetDefault("PORT", 8081)
+	// Default HTTP port is 8080 (matching Cloud Run and GKE container conventions);
+	// override via PORT env var when running multiple services locally on one host.
+	cfg.SetDefault("PORT", 8080)
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")

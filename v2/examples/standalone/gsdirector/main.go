@@ -62,7 +62,9 @@ func main() {
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
-	cfg.SetDefault("PORT", "8090")
+	// Default HTTP port is 8080 (matching Cloud Run and GKE container conventions);
+	// override via PORT env var when running multiple services locally on one host.
+	cfg.SetDefault("PORT", 8080)
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
 	cfg.SetDefault("SOLODUEL_PORT", 50090)
 	// Optional DEBUG MMF endpoint config (disabled by default in standalone
