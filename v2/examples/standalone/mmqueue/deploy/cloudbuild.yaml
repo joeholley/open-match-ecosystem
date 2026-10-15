@@ -1,0 +1,104 @@
+# First, build and push the container image from the v2/ module root using v2/cloudbuild.yaml:
+#   gcloud builds submit --async \
+#     --substitutions=COMMIT_SHA=<CONTAINER_IMAGE_TAG_TO_DEPLOY>,_JOB_NAME=mmqueue,_GOOGLE_BUILDABLE=./examples/standalone/mmqueue
+#
+# Then, to deploy using this cloudbuild.yaml from its directory:
+#   gcloud builds submit --async --no-source \
+#     --substitutions=COMMIT_SHA=<CONTAINER_IMAGE_TAG_TO_DEPLOY>
+#
+# Depending on how your project is set up, you may need to add the required Cloud Run role
+# (https://cloud.google.com/run/docs/reference/iam/roles) to the cloud build
+# service account using a gcloud command like this:
+#   gcloud projects add-iam-policy-binding $(gcloud config get project) \
+#     --member=serviceAccount:$(gcloud projects list --filter=$(gcloud config get project) --format="value(PROJECT_NUMBER)")-compute@developer.gserviceaccount.com \
+#     --role=roles/run.developer
+# You probably also need to allow Cloud Build to deploy using this application's custom Cloud Run _SERVICE_ACCOUNT:
+#   gcloud iam service-accounts add-iam-policy-binding \
+#     <_SERVICE_ACCOUNT>@$(gcloud config get project).iam.gserviceaccount.com \
+#     --role=roles/iam.serviceAccountUser \
+#     --member=serviceAccount:$(gcloud projects list --filter=$(gcloud config get project) --format="value(PROJECT_NUMBER)")-compute@developer.gserviceaccount.com
+
+substitutions:
+  # Cloud deploy vars
+  _ARTIFACT_REGISTRY_URI: us-docker.pkg.dev/open-match-public-images/open-match2
+  _JOB_NAME: mmqueue
+  _SERVICE_ACCOUNT: mmqueue-identity
+  _RUN_REGION: us-central1
+  _OTEL_SIDECAR_IMAGE: us-docker.pkg.dev/open-match-public-images/open-match2/otel-collector-sidecar
+
+  # Application environment vars
+  _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
+  _GCP_PROJECT_ID: GCP_PROJECT_ID
+  _ASSIGNMENT_TOPIC_ID: assignments
+  _LOGGING_LEVEL: info
+
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: "Deploy:ingress internal, all egress vpc"
+    waitFor: ["-"]
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      # service config
+      - ${_JOB_NAME}
+      - --no-allow-unauthenticated
+      - --service-account
+      - ${_SERVICE_ACCOUNT}
+      - --region
+      - ${_RUN_REGION}
+      # The standalone matchmaking queue runs continuous background goroutines
+      # (mmqueue.Run batch ticket activation and Pub/Sub assignment streaming)
+      # alongside an OpenTelemetry Collector sidecar container, so it requires
+      # --no-cpu-throttling, --execution-environment=gen2, and --min-instances=1.
+      - --no-cpu-throttling
+      - --execution-environment=gen2
+      - --min-instances=1
+
+      # Network config
+      - --network
+      - default
+      - --subnet
+      - default
+      - --vpc-egress
+      - all-traffic
+
+      # ingress config: restrict to internal VPC traffic by default (or use
+      # internal-and-cloud-load-balancing when fronted by an Application Load Balancer)
+      - --ingress
+      - internal
+
+      # sidecar 'otel-collector' config
+      - --container
+      - "opentelemetry-collector"
+      - --image
+      - '${_OTEL_SIDECAR_IMAGE}'
+
+      # 'mmqueue' container config
+      - --container
+      - "mmqueue"
+      - --image
+      - '${_ARTIFACT_REGISTRY_URI}/${_JOB_NAME}:${COMMIT_SHA}'
+      - --port
+      - "8080"
+      - --memory
+      - 1024Mi
+
+      # env vars for 'mmqueue'
+      - --update-env-vars
+      - "OM_CORE_ADDR=${_OM_CORE_ADDR}"
+      - --update-env-vars
+      - "GCP_PROJECT_ID=${_GCP_PROJECT_ID}"
+      - --update-env-vars
+      - "ASSIGNMENT_TOPIC_ID=${_ASSIGNMENT_TOPIC_ID}"
+      - --update-env-vars
+      - "LOGGING_LEVEL=${_LOGGING_LEVEL}"
+      # Default 500: max ticket IDs per ActivateTickets call; must be <= om-core OM_MAX_STATE_UPDATES_PER_CALL.
+      # - --update-env-vars
+      # - "OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500"
+      # Default 500: maximum concurrent in-flight CreateTicket calls to om-core.
+      # - --update-env-vars
+      # - "MAX_CONCURRENT_TICKET_CREATIONS=500"
+      # Default 0: synthetic test tickets generated per cycle (set >0 or use /tpc/{tixPerCycle} for load testing).
+      # - --update-env-vars
+      # - "INITIAL_TPC=0"

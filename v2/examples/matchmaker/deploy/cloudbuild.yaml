@@ -36,7 +36,7 @@ substitutions:
 steps:
      
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    id: "Deploy:ingress public, all egress vpc"
+    id: "Deploy:ingress internal, all egress vpc"
     waitFor: ["-"]
     entrypoint: gcloud
     args:
@@ -67,9 +67,9 @@ steps:
       - --vpc-egress
       - all-traffic
 
-      # ingress config
+      # ingress config: restrict to internal VPC / Cloud Run service-to-service traffic
       - --ingress
-      - all
+      - internal
 
       # sidecar 'otel-collector' config
       - --container
