@@ -508,7 +508,9 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 // your platform service acts as a 'proxy' for the player's game client from
 // the viewpoint of Open Match.
 func (q *MatchmakerQueue) proxyCreateTicket(ctx context.Context, ticket *pb.Ticket) (string, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	// Derive from the caller's ctx (rather than context.Background()) so queue
+	// shutdown cancellation propagates into CreateTicket and stops retry backoff.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Local var declarations
@@ -541,8 +543,10 @@ func (q *MatchmakerQueue) proxyCreateTicket(ctx context.Context, ticket *pb.Tick
 			id, err = q.OmClient.CreateTicket(ctx, ticket)
 			return err
 		},
+		// Wrap the exponential backoff policy with backoff.WithContext so retries
+		// abort immediately if ctx is cancelled during shutdown.
 		// TODO: expose max elapsed retry time as a configurable deadline parameter
-		backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
+		backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)), ctx),
 		func(err error, bo time.Duration) {
 			otelTicketCreationRetries.Add(ctx, 1)
 			logger.Warnf("CreateTicket temporary failure (backoff for %v): %v", err, bo)

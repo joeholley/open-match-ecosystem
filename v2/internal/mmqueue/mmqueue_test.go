@@ -601,3 +601,58 @@ func TestMatchmakerQueueRun_ContextCancellationUnblocksAndDrainsPending(t *testi
 		}
 	})
 }
+
+// TestProxyCreateTicket_AbortsRetryBackoffOnContextCancel verifies that
+// proxyCreateTicket derives its context from the caller's ctx and wraps its
+// exponential backoff with backoff.WithContext so cancelling ctx during a
+// transient 503 failure aborts the retry loop immediately rather than waiting
+// for the full 5-second max elapsed backoff window.
+func TestProxyCreateTicket_AbortsRetryBackoffOnContextCancel(t *testing.T) {
+	var (
+		firstAttemptOnce sync.Once
+		firstAttemptCh   = make(chan struct{})
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstAttemptOnce.Do(func() {
+			close(firstAttemptCh)
+		})
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("transient unavailable"))
+	}))
+	defer srv.Close()
+
+	q, _ := newTestQueue(srv.URL, 5, 10)
+	registerMetrics(q.OtelMeterPtr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := q.proxyCreateTicket(ctx, &pb.Ticket{})
+		errCh <- err
+	}()
+
+	select {
+	case <-firstAttemptCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first CreateTicket attempt")
+	}
+
+	// Cancel ctx while proxyCreateTicket is in its retry backoff sleep.
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected non-nil error from proxyCreateTicket after ctx cancellation")
+		}
+		if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+			t.Errorf("proxyCreateTicket took %v after ctx cancel, expected immediate abort (< 1.5s vs 5s max elapsed time)", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxyCreateTicket to abort retry backoff on ctx cancellation")
+	}
+}

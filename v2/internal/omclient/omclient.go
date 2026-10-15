@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +42,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var MMFsComplete = errors.New("Open Match HTTP client detected that the stream of matches from OM was complete and cancelled the context")
@@ -96,7 +96,9 @@ func New(cfg *viper.Viper, log *logrus.Logger, client *http.Client) *RestfulOMGr
 // matchmaking ticket. In this sense, Open Match sees your platform services
 // layer as a 'proxy' for the player's game client.
 func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Ticket) (string, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	// Derive from the caller's ctx (rather than context.Background()) so caller
+	// deadlines and graceful shutdown cancellation propagate into rc.Post.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	logger := rc.Log.WithFields(logrus.Fields{
@@ -485,74 +487,106 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	if err != nil {
 		logger.WithFields(logrus.Fields{
 			"pb_message": "MmfRequest",
+			"error":      err,
 		}).Errorf("cannot marshal protobuf to json")
-	} else {
-		logger.Trace("Marshalled MmfRequest protobuf message to JSON")
+		return
 	}
+	logger.Trace("Marshalled MmfRequest protobuf message to JSON")
 
 	// HTTP version of gRPC InvokeMatchmakingFunctions() call
 	logger.Trace("Calling InvokeMatchmakingFunctions()")
 	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", req)
 	if err != nil {
 		logger.Errorf("InvokeMatchmakingFunction call failed: %v", err)
-	} else if resp != nil && resp.StatusCode != http.StatusOK {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return
+	}
+	if resp == nil || resp.Body == nil {
+		logger.Error("InvokeMatchmakingFunction call returned nil HTTP response")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		logger.Errorf("InvokeMatchmakingFunction call failed: %v", resp.StatusCode)
-		resp.Body.Close()
-	} else {
-		logger.Tracef("InvokeMatchmakingFunction call successful: %v", resp.StatusCode)
+		return
+	}
 
-		// Process the result stream line-by-line. Use bufio.Scanner instead of
-		// fmt.Fscanf("%s\n") because protojson-serialized extensions may contain
-		// spaces inside JSON string values.
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-		for scanner.Scan() {
-			var resPb *pb.StreamedMmfResponse
-			msg := strings.TrimSpace(scanner.Text())
-			if msg == "" {
-				continue
-			}
+	logger.Tracef("InvokeMatchmakingFunction call successful: %v", resp.StatusCode)
 
-			// Easy to miss: grpc-gateway returns your result inside a
-			// overarching JSON enclosure under the key 'result', so
-			// the actual text we need to pass to protojson.Unmarshal
-			// needs to omit the top level JSON object. Rather than
-			// marshal the text to json (which is slow), we just use
-			// string trimming functions.
-			trimmedMsg := strings.TrimSuffix(strings.TrimPrefix(msg, `{"result":`), "}")
-			logger.WithFields(logrus.Fields{
-				"pb_message": "StreamedMmfResponse",
-			}).Tracef("HTTP response JSON body version of StreamedMmfResponse received")
+	// Process the result stream line-by-line. Use bufio.Scanner instead of
+	// fmt.Fscanf("%s\n") because protojson-serialized extensions may contain
+	// spaces inside JSON string values.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		msg := strings.TrimSpace(scanner.Text())
+		if msg == "" {
+			continue
+		}
 
-			// Unmarshal json back into protobuf
-			resPb = &pb.StreamedMmfResponse{}
-			err = protojson.Unmarshal([]byte(trimmedMsg), resPb)
-			if err != nil {
+		// grpc-gateway wraps each streamed message in a top-level JSON envelope:
+		//   - {"result": <StreamedMmfResponse JSON>} for normal match responses, or
+		//   - {"error": {"code": <int>, "message": "<string>", ...}} if an RPC
+		//     error occurs mid-stream after HTTP 200 headers were already sent.
+		// Parse the outer envelope first so mid-stream RPC errors are logged
+		// cleanly instead of being misparsed as empty StreamedMmfResponse messages.
+		var envelope struct {
+			Result json.RawMessage `json:"result"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		payload := []byte(msg)
+		if jsonErr := json.Unmarshal(payload, &envelope); jsonErr == nil {
+			if envelope.Error != nil {
 				logger.WithFields(logrus.Fields{
-					"pb_message":    "StreamedMmfResponse",
-					"http_response": trimmedMsg,
-					"error":         err,
-				}).Errorf("cannot unmarshal http response body back into protobuf")
+					"code":  envelope.Error.Code,
+					"error": envelope.Error.Message,
+				}).Errorf("InvokeMatchmakingFunction stream returned error: %s (code %d)", envelope.Error.Message, envelope.Error.Code)
 				continue
-			} else {
-				logger.Trace("Successfully unmarshalled HTTP response JSON body back into StreamedMmfResponse protobuf message")
 			}
-
-			if resPb.GetMatch() == nil {
-				logger.Trace("StreamedMmfResponse protobuf was empty!")
-				continue // Loop again to get the next streamed response
+			if len(envelope.Result) > 0 {
+				payload = envelope.Result
 			}
-
-			// Send back the streamed responses as we get them
-			logger.Trace("StreamedMmfResponse protobuf exists and is not empty")
-			respChan <- resPb
-		}
-		if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-			logger.Errorf("Error reading stream, closing: %v", err)
 		}
 
-		// Close response body
-		resp.Body.Close()
+		logger.WithFields(logrus.Fields{
+			"pb_message": "StreamedMmfResponse",
+		}).Tracef("HTTP response JSON body version of StreamedMmfResponse received")
+
+		// Unmarshal json back into protobuf
+		resPb := &pb.StreamedMmfResponse{}
+		err = protojson.Unmarshal(payload, resPb)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"pb_message":    "StreamedMmfResponse",
+				"http_response": string(payload),
+				"error":         err,
+			}).Errorf("cannot unmarshal http response body back into protobuf")
+			continue
+		}
+		logger.Trace("Successfully unmarshalled HTTP response JSON body back into StreamedMmfResponse protobuf message")
+
+		if resPb.GetMatch() == nil {
+			logger.Trace("StreamedMmfResponse protobuf was empty!")
+			continue // Loop again to get the next streamed response
+		}
+
+		// Send back the streamed responses as we get them
+		logger.Trace("StreamedMmfResponse protobuf exists and is not empty")
+		select {
+		case respChan <- resPb:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		logger.Errorf("Error reading stream, closing: %v", err)
 	}
 }
 
@@ -704,24 +738,43 @@ func readAllBody(resp http.Response, logger *logrus.Entry) ([]byte, error) {
 	return body, err
 }
 
-// ValidateConnection can be used to check that the RestfulOMGrpcClient can
-// send requests to the provide Open Match URL
+// ValidateConnection checks that RestfulOMGrpcClient can reach and authenticate
+// against the provided Open Match core URL without writing dummy tickets to state
+// storage.
+//
+// It probes "/tickets:deactivate" with an empty DeactivateTicketsRequest. On a
+// live om-core instance, DeactivateTickets validates the empty request in memory
+// and returns HTTP 400 Bad Request (codes.InvalidArgument) without touching Redis
+// or recording ticket metrics; stub test servers may also return HTTP 200 OK.
+// Any other HTTP status code (such as 401/403 auth rejection, 404 wrong route,
+// or 5xx server failure) or transport error is returned as an error, and
+// resp.Body is always drained and closed so the underlying connection can be
+// reused by http.Transport.
 func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url string) error {
+	buf, err := protojson.Marshal(&pb.DeactivateTicketsRequest{})
+	if err != nil {
+		return err
+	}
 
-	// Make a dummy ticket that will immediately expire and matches no filters.
-	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
-		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()},
-	})
-	// Try to create the dummy ticket.
 	resp, err := rc.Post(ctx,
 		rc.Log.WithFields(logrus.Fields{
 			"operation": "proxy_ValidateConnection",
 		}),
-		url, "/", buf)
-	if resp != nil {
+		url, "/tickets:deactivate", buf)
+	if resp != nil && resp.Body != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return errors.New("ValidateConnection received nil HTTP response")
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
+		return fmt.Errorf("ValidateConnection unexpected HTTP status: %s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
+	}
+	return nil
 }
 
 // syncMapDump can be uncommented and called to see the contents of a sync.Map

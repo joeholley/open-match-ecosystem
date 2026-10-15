@@ -15,11 +15,15 @@
 package omclient
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -686,4 +690,223 @@ func TestPost_CloudRunTokenRefreshedOn401(t *testing.T) {
 	if len(receivedBodies) != 2 || receivedBodies[0] == "" || receivedBodies[0] != receivedBodies[1] {
 		t.Errorf("expected non-empty identical request body on 401 retry, got %v", receivedBodies)
 	}
+}
+
+// TestCreateTicket_ContextCancellation verifies that CreateTicket derives its
+// request context from the caller's ctx (rather than context.Background()) so
+// pre-cancelled contexts and in-flight cancellations abort the HTTP request.
+func TestCreateTicket_ContextCancellation(t *testing.T) {
+	t.Run("pre-cancelled context aborts without hitting server", func(t *testing.T) {
+		var hits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ticketId":"1790307871351-1"}`))
+		}))
+		defer srv.Close()
+
+		client := newTestOMClient(srv.URL, 10)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		id, err := client.CreateTicket(ctx, &pb.Ticket{})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("CreateTicket with pre-cancelled ctx error = %v, want context.Canceled", err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ticketId on cancelled ctx, got %q", id)
+		}
+		if got := hits.Load(); got != 0 {
+			t.Errorf("expected 0 HTTP requests on pre-cancelled ctx, got %d", got)
+		}
+	})
+
+	t.Run("in-flight context cancellation aborts blocked request", func(t *testing.T) {
+		enteredCh := make(chan struct{})
+		releaseHandlerCh := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(enteredCh)
+			<-releaseHandlerCh
+		}))
+		defer srv.Close()
+		defer close(releaseHandlerCh)
+
+		client := newTestOMClient(srv.URL, 10)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := client.CreateTicket(ctx, &pb.Ticket{})
+			errCh <- err
+		}()
+
+		select {
+		case <-enteredCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for CreateTicket HTTP request to reach server")
+		}
+
+		cancel()
+
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("CreateTicket error after in-flight cancel = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for CreateTicket to abort after ctx cancellation")
+		}
+	})
+}
+
+// TestValidateConnection verifies that ValidateConnection probes POST /tickets:deactivate
+// with an empty DeactivateTicketsRequest (without creating dummy tickets), accepts
+// HTTP 200 OK and HTTP 400 Bad Request, and returns an error on auth/routing/server
+// error status codes (401, 403, 404, 503).
+func TestValidateConnection(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		wantErr    bool
+	}{
+		{name: "200 OK succeeds", statusCode: http.StatusOK, wantErr: false},
+		{name: "400 Bad Request from live om-core empty DeactivateTickets succeeds", statusCode: http.StatusBadRequest, wantErr: false},
+		{name: "401 Unauthorized fails", statusCode: http.StatusUnauthorized, wantErr: true},
+		{name: "403 Forbidden fails", statusCode: http.StatusForbidden, wantErr: true},
+		{name: "404 Not Found fails", statusCode: http.StatusNotFound, wantErr: true},
+		{name: "503 Service Unavailable fails", statusCode: http.StatusServiceUnavailable, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu         sync.Mutex
+				gotMethod  string
+				gotPath    string
+				gotReqBody []byte
+			)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotReqBody = body
+				mu.Unlock()
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.statusCode)
+				_, _ = w.Write([]byte(`{"message":"probe response"}`))
+			}))
+			defer srv.Close()
+
+			client := newTestOMClient(srv.URL, 10)
+			err := client.ValidateConnection(context.Background(), srv.URL)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateConnection() error = %v, wantErr %v", err, tc.wantErr)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if gotMethod != http.MethodPost {
+				t.Errorf("ValidateConnection HTTP method = %q, want POST", gotMethod)
+			}
+			if gotPath != "/tickets:deactivate" {
+				t.Errorf("ValidateConnection HTTP path = %q, want /tickets:deactivate", gotPath)
+			}
+			var deactReq pb.DeactivateTicketsRequest
+			if uErr := protojson.Unmarshal(gotReqBody, &deactReq); uErr != nil {
+				t.Errorf("ValidateConnection body did not unmarshal as DeactivateTicketsRequest: %v", uErr)
+			}
+			if len(deactReq.GetTicketIds()) != 0 {
+				t.Errorf("ValidateConnection DeactivateTicketsRequest.TicketIds = %v, want empty", deactReq.GetTicketIds())
+			}
+		})
+	}
+}
+
+// TestInvokeMatchmakingFunctions_MidStreamErrorEnvelope verifies that
+// InvokeMatchmakingFunctions parses the grpc-gateway JSON envelope on streamed
+// responses from /matches:fetch, logs mid-stream {"error": ...} objects without
+// emitting bogus matches, skips empty {"result": {}} objects, and forwards only
+// valid match responses to respChan before closing it.
+func TestInvokeMatchmakingFunctions_MidStreamErrorEnvelope(t *testing.T) {
+	t.Run("mid-stream error envelope is logged and skipped while valid matches are delivered", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/matches:fetch" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+
+			m1Bytes, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: &pb.Match{Id: "match-1"}})
+			m2Bytes, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: &pb.Match{Id: "match-2"}})
+
+			// Stream:
+			// 1. Valid match-1 result envelope
+			// 2. Mid-stream grpc-gateway error envelope
+			// 3. Empty result envelope (nil Match)
+			// 4. Valid match-2 result envelope
+			_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(m1Bytes))
+			_, _ = fmt.Fprintln(w, `{"error":{"code":13,"message":"simulated mid-stream MMF error"}}`)
+			_, _ = fmt.Fprintln(w, `{"result":{}}`)
+			_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(m2Bytes))
+		}))
+		defer srv.Close()
+
+		var logBuf bytes.Buffer
+		cfg := viper.New()
+		cfg.Set("OM_CORE_ADDR", srv.URL)
+		logger := logrus.New()
+		logger.SetOutput(&logBuf)
+		client := New(cfg, logger, srv.Client())
+
+		respChan := make(chan *pb.StreamedMmfResponse, 10)
+		client.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{
+			Profile: &pb.Profile{Name: "test-profile"},
+		}, respChan)
+
+		var gotMatchIDs []string
+		for res := range respChan {
+			if res == nil || res.GetMatch() == nil {
+				t.Errorf("received nil StreamedMmfResponse or nil Match on respChan: %v", res)
+				continue
+			}
+			gotMatchIDs = append(gotMatchIDs, res.GetMatch().GetId())
+		}
+
+		wantIDs := []string{"match-1", "match-2"}
+		if !slices.Equal(gotMatchIDs, wantIDs) {
+			t.Errorf("received match IDs = %v, want %v", gotMatchIDs, wantIDs)
+		}
+
+		logOutput := logBuf.String()
+		if !strings.Contains(logOutput, "simulated mid-stream MMF error") || !strings.Contains(logOutput, "code 13") {
+			t.Errorf("expected mid-stream error message and code 13 in logs, got:\n%s", logOutput)
+		}
+	})
+
+	t.Run("non-200 HTTP status drains body and closes respChan with zero matches", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("service unavailable"))
+		}))
+		defer srv.Close()
+
+		client := newTestOMClient(srv.URL, 10)
+		respChan := make(chan *pb.StreamedMmfResponse, 10)
+		client.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{
+			Profile: &pb.Profile{Name: "test-profile"},
+		}, respChan)
+
+		var count int
+		for range respChan {
+			count++
+		}
+		if count != 0 {
+			t.Errorf("expected 0 matches on 503 response, got %d", count)
+		}
+	})
 }
