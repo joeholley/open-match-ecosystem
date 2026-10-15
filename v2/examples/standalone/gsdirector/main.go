@@ -20,12 +20,10 @@ import (
 	"io"
 	"math"
 	"net/http"
-	_ "net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -47,12 +45,8 @@ import (
 )
 
 var (
-	statusUpdateMutex sync.RWMutex
-	cycleStatus       string
-	cfg               = viper.New()
-	tickets           sync.Map
-	meterptr          *metric.Meter
-	otelShutdownFunc  func(context.Context) error
+	meterptr         *metric.Meter
+	otelShutdownFunc func(context.Context) error
 )
 
 func main() {
@@ -62,6 +56,9 @@ func main() {
 	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Read config
+	cfg := viper.New()
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
@@ -242,7 +239,6 @@ func main() {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {
 			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
-			os.Exit(1)
 		}
 	}
 
@@ -250,11 +246,10 @@ func main() {
 	// call, and matches returned.
 	go d.Run(ctx)
 
-	// Basic default handler that just returns the current matchmaking progress status as a string.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		statusUpdateMutex.RLock()
-		defer statusUpdateMutex.RUnlock()
-		io.WriteString(w, cycleStatus)
+	// Return the latest matchmaking cycle status on exact GET / requests ("GET /{$}"
+	// in Go 1.22+ ServeMux matches only the root path "/" and not arbitrary subpaths).
+	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, d.Status())
 	})
 
 	// Start http server so this application can be run on serverless platforms.

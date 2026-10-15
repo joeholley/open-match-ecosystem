@@ -55,9 +55,7 @@ import (
 )
 
 var (
-	logger            = &logrus.Logger{}
-	statusUpdateMutex sync.RWMutex
-	tickets           sync.Map
+	logger = &logrus.Logger{}
 
 	// pool with a set of filters to find all players. Really only
 	// useful in development and testing; Always use some meaningful
@@ -1007,6 +1005,16 @@ type MockDirector struct {
 	GSManager                GameServerManager
 	OtelMeterPtr             *metric.Meter
 	pendingMmfRequestsByHash map[string]*pb.MmfRequest
+	statusMu                 sync.RWMutex
+	cycleStatus              string
+}
+
+// Status returns the most recent matchmaking cycle status summary recorded by
+// Run in a concurrency-safe manner for HTTP status/health endpoints.
+func (d *MockDirector) Status() string {
+	d.statusMu.RLock()
+	defer d.statusMu.RUnlock()
+	return d.cycleStatus
 }
 
 // hasDeactivationTimeout checks whether om-core annotated the match with
@@ -1507,7 +1515,6 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 			// This proposed match passed all our decision points and validation checks,
 			// lets add it to the map of matches we want to allocate a server for.
-			//acceptedMatchesCounter.Add(ctx, 1)
 			matches[match] = allocatorSpec
 		}
 
@@ -1718,6 +1725,12 @@ func (d *MockDirector) Run(ctx context.Context) {
 				elapsedPct,
 				next,
 			)
+
+			// Persist the latest cycle status under statusMu so HTTP status
+			// handlers (e.g., GET /{$}) can read it via d.Status() without data races.
+			d.statusMu.Lock()
+			d.cycleStatus = cycleStatus
+			d.statusMu.Unlock()
 
 			lLogger.Info(cycleStatus)
 

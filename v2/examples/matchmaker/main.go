@@ -28,15 +28,14 @@ package main
 
 import (
 	"context"
+	"io"
 	"math"
 	"net/http"
-	_ "net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -65,12 +64,8 @@ import (
 
 var (
 	// global vars
-	statusUpdateMutex sync.RWMutex
-	cycleStatus       string
-	cfg               = viper.New()
-	tickets           sync.Map
-	otelShutdownFunc  func(context.Context) error
-	meterptr          *metric.Meter
+	otelShutdownFunc func(context.Context) error
+	meterptr         *metric.Meter
 
 	// configuration that requires recompilation
 	mockClientTicket = gameclient.Simple
@@ -351,30 +346,26 @@ func main() {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
 
-	//Check connection before spinning up the matchmaking queue
+	//Check connection before spinning up the matchmaking queue and director
 	err = q.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
 	if err != nil {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {
 			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
-			os.Exit(1)
 		}
 	}
 	// Start the ticket matchmaking queue. This is where tickets get processd and stored in OM2.
 	go q.Run(ctx)
 
-	//Check connection before spinning up the game server director
-	err = d.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
-	if err != nil {
-		logger.Errorf("OM Connection test failure: %v", err)
-		if strings.Contains(err.Error(), "connect: connection refused") {
-			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
-			os.Exit(1)
-		}
-	}
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
 	go d.Run(ctx)
+
+	// Return the latest matchmaking cycle status on exact GET / requests ("GET /{$}"
+	// in Go 1.22+ ServeMux matches only the root path "/" and not arbitrary subpaths).
+	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, d.Status())
+	})
 
 	// Handler to manually insert 1 test ticket into the queue.
 	http.HandleFunc("/tickets", func(w http.ResponseWriter, r *http.Request) {

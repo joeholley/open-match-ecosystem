@@ -21,6 +21,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -954,4 +955,60 @@ func TestMockDirectorRun_ContextCancelInterruptsInterCycleSleepAndFlushesReactiv
 			t.Errorf("reactivatedIDs after Run() returned = %v, want [%q]", reactivatedIDs, rejectedTicketID)
 		}
 	})
+}
+
+// TestMockDirectorStatus_PopulatedAndConcurrencySafe verifies that MockDirector.Status
+// returns an empty string prior to Run, is concurrency-safe when read concurrently
+// with Run under -race, and returns the formatted cycle status summary after Run completes.
+func TestMockDirectorStatus_PopulatedAndConcurrencySafe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := viper.New()
+	cfg.Set("NUM_MM_CYCLES", 5)
+	cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 0)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 0)
+	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+	cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	d := &MockDirector{
+		OmClient:     omclient.New(cfg, log, &http.Client{}),
+		GSManager:    &stubGSManager{},
+		Cfg:          cfg,
+		Log:          log,
+		OtelMeterPtr: testMeter(),
+	}
+
+	if got := d.Status(); got != "" {
+		t.Fatalf("d.Status() before Run = %q, want empty string", got)
+	}
+
+	// Read d.Status() concurrently while d.Run(ctx) executes 5 cycles.
+	stopReaders := make(chan struct{})
+	var readerWg sync.WaitGroup
+	readerWg.Add(1)
+	go func() {
+		defer readerWg.Done()
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				_ = d.Status()
+			}
+		}
+	}()
+
+	d.Run(ctx)
+	close(stopReaders)
+	readerWg.Wait()
+
+	gotStatus := d.Status()
+	if !strings.Contains(gotStatus, "director mmf invocation cycle 0000000005/0000000006") {
+		t.Errorf("d.Status() after 5 cycles = %q, want substring %q",
+			gotStatus, "director mmf invocation cycle 0000000005/0000000006")
+	}
 }

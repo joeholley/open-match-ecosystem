@@ -63,7 +63,6 @@ import (
 	"context"
 	"math"
 	"net/http"
-	_ "net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
@@ -212,7 +211,6 @@ func main() {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {
 			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
-			os.Exit(1)
 		}
 	}
 	// Start the queue. This is where requests are processed and added to Open Match.
