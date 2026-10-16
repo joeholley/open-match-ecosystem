@@ -1482,3 +1482,229 @@ func TestMockDirectorRun_SameCycleAndCrossCycleCollisionRejectionAndReactivation
 	assertHistSumAtLeast("gsdirector.ticket.rejections.assigned", 1)
 	assertHistSumAtLeast("gsdirector.matchmaking_cycle.match.rejections", 2)
 }
+
+// TestMockDirectorRun_AssignmentTTLExpiresAllTicketsInMultiTicketRoster verifies
+// that when a match with a multi-ticket roster (["t-ttl-1", "t-ttl-2", "t-ttl-3",
+// "t-ttl-4"]) is allocated, all 4 ticket IDs are appended to assignmentTTL[ttl]
+// (without overwriting the slice on the 2nd..4th tickets) and all 4 are deleted
+// from assignments once ASSIGNMENT_TTL_MS expires and maps.Clone compaction runs
+// (gsdirector.go:1600-1644). Consequently, a subsequent match proposing those
+// same 4 tickets after TTL expiration is accepted and allocated with zero
+// cross-cycle assigned-ticket rejections.
+func TestMockDirectorRun_AssignmentTTLExpiresAllTicketsInMultiTicketRoster(t *testing.T) {
+	// Seed package-level math/rand so ProposalsLoop's 2% random test check
+	// (gsdirector.go:1416) deterministically accepts the first matches.
+	rand.Seed(1) //nolint:staticcheck // gsdirector.go uses top-level math/rand.Intn
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	const (
+		testReqHash     = "hash-ttl-fleet"
+		baseAllocSpec   = `{"spec":"ttl-fleet"}`
+		initialMatchID  = "match-initial-4tix"
+		requeuedMatchID = "match-requeued-after-ttl"
+	)
+	rosterTickets := []*pb.Ticket{
+		{Id: "t-ttl-1"},
+		{Id: "t-ttl-2"},
+		{Id: "t-ttl-3"},
+		{Id: "t-ttl-4"},
+	}
+
+	hashAny, err := anypb.New(&knownpb.StringValue{Value: testReqHash})
+	if err != nil {
+		t.Fatalf("anypb.New(hash): %v", err)
+	}
+	allocAny, err := anypb.New(&knownpb.StringValue{Value: baseAllocSpec})
+	if err != nil {
+		t.Fatalf("anypb.New(alloc): %v", err)
+	}
+
+	gsMgr := &trackingGSManager{
+		requests: []*pb.MmfRequest{
+			{
+				Mmfs: []*pb.MatchmakingFunctionSpec{Fifo},
+				Profile: &pb.Profile{
+					Name: "fleet.soloduel.ttl",
+					Extensions: map[string]*anypb.Any{
+						ex.MMFRequestHashKey: hashAny,
+						ex.AgonesAllocatorKey: allocAny,
+					},
+				},
+			},
+		},
+		allocatedMatches: make(map[string]string),
+		updatedSpecs:     make(map[string]*pb.MmfRequest),
+	}
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
+	meter := mp.Meter("gsdirector-ttl-test")
+
+	var (
+		mu                  sync.Mutex
+		reactivatedIDs      []string
+		expiredSweepRanOnce bool
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tickets:activate":
+			body, _ := io.ReadAll(r.Body)
+			var reqPb pb.ActivateTicketsRequest
+			_ = protojson.Unmarshal(body, &reqPb)
+			mu.Lock()
+			reactivatedIDs = append(reactivatedIDs, reqPb.GetTicketIds()...)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+
+		case "/matches:fetch":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+
+			var toStream []*pb.Match
+			mu.Lock()
+			sweepDone := expiredSweepRanOnce
+			if gsMgr.isAllocated(initialMatchID) && !expiredSweepRanOnce {
+				// Phase 2: Stream one empty cycle after initialMatchID was allocated
+				// and the inter-cycle sleep (25ms > ASSIGNMENT_TTL_MS=10ms) elapsed.
+				// At the end of this empty cycle, the assignmentTTL expiration loop
+				// and maps.Clone compaction run and remove all 4 tickets from assignments.
+				expiredSweepRanOnce = true
+			}
+			mu.Unlock()
+
+			switch {
+			case !gsMgr.isAllocated(initialMatchID):
+				// Phase 1: Stream initialMatchID with 4 tickets.
+				toStream = []*pb.Match{
+					{
+						Id: initialMatchID,
+						Rosters: map[string]*pb.Roster{
+							"r1": {Tickets: rosterTickets},
+						},
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: hashAny,
+						},
+					},
+				}
+			case !sweepDone:
+				// Phase 2: Empty cycle so end-of-cycle TTL expiration runs before
+				// requeuedMatchID is evaluated in Phase 3.
+				toStream = nil
+			case !gsMgr.isAllocated(requeuedMatchID):
+				// Phase 3: Stream requeuedMatchID with the exact same 4 tickets.
+				// Because all 4 tickets were expired from assignments at the end
+				// of Phase 2, this match must be accepted with 0 assigned rejections.
+				toStream = []*pb.Match{
+					{
+						Id: requeuedMatchID,
+						Rosters: map[string]*pb.Roster{
+							"r1": {Tickets: rosterTickets},
+						},
+						Extensions: map[string]*anypb.Any{
+							ex.MMFRequestHashKey: hashAny,
+						},
+					},
+				}
+			default:
+				// Phase 4: Both matches allocated; cancel ctx so Run() exits cleanly.
+				cancel()
+			}
+
+			for _, m := range toStream {
+				raw, mErr := protojson.Marshal(&pb.StreamedMmfResponse{Match: m})
+				if mErr != nil {
+					t.Errorf("protojson.Marshal(StreamedMmfResponse): %v", mErr)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(raw))
+			}
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := viper.New()
+	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("NUM_MM_CYCLES", 20)
+	cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 0)
+	// Configure ASSIGNMENT_TTL_MS=10ms and MM_CYCLE_MIN_DURATION_MS=25ms so the
+	// inter-cycle sleep guarantees the 10ms assignment TTL has expired before
+	// the next cycle's end-of-cycle TTL sweep and maps.Clone compaction run.
+	cfg.Set("ASSIGNMENT_TTL_MS", 10)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 25)
+	cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	sender := &recordingAssignmentSender{}
+	d := &MockDirector{
+		OmClient:            omclient.New(cfg, log, srv.Client()),
+		GSManager:           gsMgr,
+		AssignmentPublisher: sender,
+		Cfg:                 cfg,
+		Log:                 log,
+		OtelMeterPtr:        &meter,
+	}
+
+	d.Run(ctx)
+
+	if !gsMgr.isAllocated(initialMatchID) {
+		t.Errorf("expected initial 4-ticket match %q to be allocated", initialMatchID)
+	}
+	if !gsMgr.isAllocated(requeuedMatchID) {
+		t.Errorf("expected re-queued 4-ticket match %q to be allocated after ASSIGNMENT_TTL_MS expired all 4 tickets", requeuedMatchID)
+	}
+
+	mu.Lock()
+	gotReactivated := slices.Clone(reactivatedIDs)
+	mu.Unlock()
+	if len(gotReactivated) != 0 {
+		t.Errorf("expected 0 rejected/reactivated tickets when re-matching after TTL expiry, got %v", gotReactivated)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	metricsByName := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricsByName[m.Name] = m
+		}
+	}
+
+	assertHistSumEquals := func(name string, wantSum int64) {
+		t.Helper()
+		m, ok := metricsByName[name]
+		if !ok {
+			t.Fatalf("expected metric %q to be registered and collected, got: %v", name, metricsByName)
+		}
+		hist, ok := m.Data.(metricdata.Histogram[int64])
+		if !ok {
+			t.Fatalf("metric %q Data type = %T, want metricdata.Histogram[int64]", name, m.Data)
+		}
+		var sum int64
+		for _, dp := range hist.DataPoints {
+			sum += dp.Sum
+		}
+		if sum != wantSum {
+			t.Errorf("metric %q histogram Sum = %d, want %d", name, sum, wantSum)
+		}
+	}
+
+	assertHistSumEquals("gsdirector.matchmaking_cycle.match.rejections.assigned", 0)
+	assertHistSumEquals("gsdirector.ticket.rejections.assigned", 0)
+	assertHistSumEquals("gsdirector.ticket.assignments", 8)
+}

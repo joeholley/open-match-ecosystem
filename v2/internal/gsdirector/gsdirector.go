@@ -1592,13 +1592,14 @@ func (d *MockDirector) Run(ctx context.Context) {
 					if err == nil { // roster assignment successfully sent
 						numTicketAssignments += int64(len(roster.GetTickets()))
 
-						// Track which tickets we've already assigned
+						// Track which tickets we've already assigned and schedule their TTL
+						// expiration. Compute the expiration timestamp once per roster and append
+						// directly to assignmentTTL[ttl] (append on a nil slice allocates
+						// automatically in Go, and preserves existing entries if multiple rosters
+						// in the same cycle share the same time.Now() reading).
+						ttl := time.Now().Add(assignmentTTLDuration)
 						for _, ticket := range roster.GetTickets() {
 							assignments[ticket.GetId()] = true
-							ttl := time.Now().Add(assignmentTTLDuration)
-							if _, nilArray := assignmentTTL[ttl]; nilArray {
-								assignmentTTL[ttl] = make([]string, 0)
-							}
 							assignmentTTL[ttl] = append(assignmentTTL[ttl], ticket.GetId())
 						}
 					} else {
@@ -1630,26 +1631,13 @@ func (d *MockDirector) Run(ctx context.Context) {
 			}
 		}
 
-		// Periodially deep copy the assignment tracking maps.
+		// Periodically clone the assignment tracking maps into freshly allocated maps.
+		// Because delete() on a Go map never shrinks its underlying bucket array after
+		// a traffic spike, replacing assignments and assignmentTTL via maps.Clone
+		// allows the garbage collector to reclaim backing bucket memory from expired entries.
 		if time.Now().After(assignmentMemoryReclaimationDeadline) {
-			// copy all assignments to a new map and point the assignments
-			// var to it, allowing the old map to be garbage collected.
-			n := make(map[string]bool)
-			for k, v := range assignments {
-				n[k] = v
-				delete(assignments, k)
-			}
-			assignments = n
-
-			// copy all assignment TTLs to a new map and point the
-			// assignmentTTL var to it, allowing the old map to be garbage
-			// collected.
-			nt := make(map[time.Time][]string)
-			for k, v := range assignmentTTL {
-				nt[k] = v
-				delete(assignmentTTL, k)
-			}
-			assignmentTTL = nt
+			assignments = maps.Clone(assignments)
+			assignmentTTL = maps.Clone(assignmentTTL)
 
 			// Make a new deadline to repeat this process.
 			assignmentMemoryReclaimationDeadline = time.Now().Add(assignmentTTLDuration)
