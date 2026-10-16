@@ -15,6 +15,7 @@
 package gsdirector
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -1835,4 +1836,82 @@ func TestMockDirectorRun_AssignmentPublisherBackoffRespectsContextCancellation(t
 	if elapsed := time.Since(cancelAt); elapsed > 500*time.Millisecond {
 		t.Errorf("MockDirector.Run took %v after ctx cancel in AssignmentPublisher.Send backoff, want < 500ms (vs 5s MaxElapsedTime)", elapsed)
 	}
+}
+
+// TestMockAgonesIntegrationInit_UsesConfiguredLoggerAndNilFallback verifies REL-04:
+//  1. MockAgonesIntegration.Init derives fLogger from m.Log (rather than an
+//     uninitialized package-level logger) so fleet initialization Debug and Info
+//     messages and fleet fields are emitted to the configured logger.
+//  2. When m.Log is nil, Init defaults m.Log to a valid *logrus.Logger without
+//     panicking.
+func TestMockAgonesIntegrationInit_UsesConfiguredLoggerAndNilFallback(t *testing.T) {
+	sampleMode := &GameMode{
+		Name: "com.example.rel04.mode",
+		Pools: map[string]*pb.Pool{
+			"everyone": {Name: "everyone"},
+		},
+		MMFs:            []*pb.MatchmakingFunctionSpec{Fifo},
+		ExtensionParams: map[string]*anypb.Any{},
+	}
+	sampleFleetCfg := map[string]map[string]string{
+		"Dedicated": {"us-west": "us-west1-a"},
+	}
+	sampleZonePools := map[string]*pb.Pool{
+		"us-west1-a": {Name: "us-west1-a"},
+	}
+	sampleModesInZone := map[string][]*GameMode{
+		"us-west1-a": {sampleMode},
+	}
+
+	t.Run("emits fleet initialization Debug and Info logs through m.Log", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		log := logrus.New()
+		log.SetOutput(&logBuf)
+		log.SetLevel(logrus.DebugLevel)
+
+		mgr := &MockAgonesIntegration{
+			Log:          log,
+			OtelMeterPtr: testMeter(),
+		}
+		t.Cleanup(func() {
+			if mgr.gameServerUpdateChan != nil {
+				close(mgr.gameServerUpdateChan)
+			}
+		})
+
+		if err := mgr.Init(sampleFleetCfg, sampleZonePools, sampleModesInZone); err != nil {
+			t.Fatalf("mgr.Init failed: %v", err)
+		}
+
+		output := logBuf.String()
+		for _, wantSubstr := range []string{
+			"Initializing matching parameters",
+			"Adding matching parameters to fleet",
+			"Matchmaking parameters for fleet successfully initialized",
+			"Dedicated/us-west@us-west1-a",
+		} {
+			if !strings.Contains(output, wantSubstr) {
+				t.Errorf("expected m.Log output to contain %q, got:\n%s", wantSubstr, output)
+			}
+		}
+	})
+
+	t.Run("defaults m.Log when nil without panicking", func(t *testing.T) {
+		mgr := &MockAgonesIntegration{
+			Log:          nil,
+			OtelMeterPtr: testMeter(),
+		}
+		t.Cleanup(func() {
+			if mgr.gameServerUpdateChan != nil {
+				close(mgr.gameServerUpdateChan)
+			}
+		})
+
+		if err := mgr.Init(sampleFleetCfg, sampleZonePools, sampleModesInZone); err != nil {
+			t.Fatalf("mgr.Init with nil Log failed: %v", err)
+		}
+		if mgr.Log == nil {
+			t.Fatal("expected mgr.Init to initialize mgr.Log when nil")
+		}
+	})
 }

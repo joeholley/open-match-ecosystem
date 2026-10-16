@@ -55,8 +55,6 @@ import (
 )
 
 var (
-	logger = &logrus.Logger{}
-
 	// pool with a set of filters to find all players. Really only
 	// useful in development and testing; Always use some meaningful
 	// filters in production matchmaking Pools!
@@ -591,6 +589,12 @@ func (m *MockAgonesIntegration) processGameServerUpdates() {
 // parts of the MockAgonesIntegration structure that are desired, and before calling
 // the gsdirector.Run() function.
 func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, zonePools map[string]*pb.Pool, gameModesInZone map[string][]*GameMode) (err error) {
+	// Default m.Log to a standard initialized logrus.Logger if the caller did
+	// not supply one so fleet initialization and background informer logs are
+	// never dropped or written to a nil io.Writer.
+	if m.Log == nil {
+		m.Log = logrus.New()
+	}
 
 	m.Log.Debug("Initializing matching parameters")
 
@@ -675,9 +679,11 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 					count: math.MaxInt32,
 				}
 
-				// Construct a fleet name based on the FleetConfig
+				// Construct a fleet name based on the FleetConfig and derive a
+				// fleet-scoped logger from m.Log so fleet initialization logs
+				// respect the configured logger output, formatter, and level.
 				fleetName := fmt.Sprintf("%s/%s@%s", category, region, zone)
-				fLogger := logger.WithFields(logrus.Fields{
+				fLogger := m.Log.WithFields(logrus.Fields{
 					"fleet": fleetName,
 				})
 				fLogger.Debug("Adding matching parameters to fleet")
