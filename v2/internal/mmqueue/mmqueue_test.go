@@ -602,7 +602,6 @@ func TestProxyCreateTicket_AbortsRetryBackoffOnContextCancel(t *testing.T) {
 	defer srv.Close()
 
 	q, _ := newTestQueue(srv.URL, 5, 10)
-	registerMetrics(q.OtelMeterPtr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -645,7 +644,6 @@ func TestGenerateTestTickets_ExitsImmediatelyOnContextCancel(t *testing.T) {
 	q, _ := newTestQueue("http://127.0.0.1:0", 5, 10)
 	q.Cfg.Set("TICKET_CREATION_CYCLES", 100)
 	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 30000) // 30s per cycle
-	registerMetrics(q.OtelMeterPtr)
 
 	q.SetTestTicketConfig(500, func(context.Context) *pb.Ticket {
 		return &pb.Ticket{}
@@ -1064,11 +1062,6 @@ func TestMatchmakerQueueRun_AssignmentDeliveryAndMetrics(t *testing.T) {
 // registered OpenTelemetry instruments initializes metrics via ensureMetrics
 // without panicking on a nil otelTicketGenerationCycleDurations histogram.
 func TestGenerateTestTickets_ZeroInitialTPCInitializesMetricsWithoutPanic(t *testing.T) {
-	// Reset package-level instruments to nil to simulate fresh process startup
-	// before either Run(ctx) or GenerateTestTickets(ctx) has called registerMetrics.
-	otelTicketGenerationCycleDurations = nil
-	otelTicketGenerationsAchievedPerCycle = nil
-
 	q, _ := newTestQueue("http://127.0.0.1:0", 5, 10)
 	q.Cfg.Set("TICKET_CREATION_CYCLES", 1)
 	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 20)
@@ -1076,14 +1069,18 @@ func TestGenerateTestTickets_ZeroInitialTPCInitializesMetricsWithoutPanic(t *tes
 		return &pb.Ticket{}
 	})
 
+	if q.otelTicketGenerationCycleDurations != nil || q.otelTicketGenerationsAchievedPerCycle != nil {
+		t.Fatal("expected fresh MatchmakerQueue instance to have nil metric instruments before ensureMetrics")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Must complete cleanly without nil-pointer dereference panic.
 	q.GenerateTestTickets(ctx)
 
-	if otelTicketGenerationCycleDurations == nil {
-		t.Fatal("expected GenerateTestTickets to initialize otelTicketGenerationCycleDurations via ensureMetrics")
+	if q.otelTicketGenerationCycleDurations == nil {
+		t.Fatal("expected GenerateTestTickets to initialize q.otelTicketGenerationCycleDurations via ensureMetrics")
 	}
 }
 
@@ -1119,4 +1116,69 @@ func TestGenerateTestTickets_RespectsDeadlineWhenQueueFull(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for GenerateTestTickets to finish 2 cycles when ClientRequestChan is full")
 	}
+}
+
+// TestMatchmakerQueue_IsolatedPerInstanceTestTicketConfig verifies REL-08:
+// TPC, tpcMutex, and newTicket are per-instance fields on MatchmakerQueue
+// (rather than package-level globals) so calling SetTestTicketConfig and
+// GenerateTestTickets on two concurrent MatchmakerQueue instances never
+// overwrites or cross-contaminates the other instance's ticket generator.
+func TestMatchmakerQueue_IsolatedPerInstanceTestTicketConfig(t *testing.T) {
+	q1, _ := newTestQueue("http://127.0.0.1:0", 5, 10)
+	q1.Cfg.Set("TICKET_CREATION_CYCLES", 1)
+	q1.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 30)
+
+	q2, _ := newTestQueue("http://127.0.0.1:0", 5, 10)
+	q2.Cfg.Set("TICKET_CREATION_CYCLES", 1)
+	q2.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 30)
+
+	// Configure q1 first and q2 second; with the old package-level newTicket
+	// global, q2.SetTestTicketConfig overwrote q1's generator function.
+	q1.SetTestTicketConfig(3, func(context.Context) *pb.Ticket {
+		return &pb.Ticket{Id: "q1-ticket"}
+	})
+	q2.SetTestTicketConfig(4, func(context.Context) *pb.Ticket {
+		return &pb.Ticket{Id: "q2-ticket"}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		q1.GenerateTestTickets(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		q2.GenerateTestTickets(ctx)
+	}()
+
+	wg.Wait()
+
+	drainAndVerify := func(name string, ch chan *ClientRequest, wantCount int, wantID string) {
+		t.Helper()
+		var gotIDs []string
+		for {
+			select {
+			case req := <-ch:
+				gotIDs = append(gotIDs, req.Ticket.GetId())
+				req.ResultChan <- http.StatusOK
+			default:
+				if len(gotIDs) != wantCount {
+					t.Fatalf("%s generated %d tickets (%v), want %d", name, len(gotIDs), gotIDs, wantCount)
+				}
+				for i, id := range gotIDs {
+					if id != wantID {
+						t.Errorf("%s ticket[%d] ID = %q, want %q", name, i, id, wantID)
+					}
+				}
+				return
+			}
+		}
+	}
+
+	drainAndVerify("q1", q1.ClientRequestChan, 3, "q1-ticket")
+	drainAndVerify("q2", q2.ClientRequestChan, 4, "q2-ticket")
 }

@@ -39,11 +39,6 @@ import (
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
-var (
-	tpcMutex  sync.Mutex
-	newTicket func(context.Context) *pb.Ticket
-)
-
 // Mock of the game platform services frontend that handles player matchmaking
 // requests, queueing them to be sent to Open Match, and processing them
 // asynchronously.
@@ -57,7 +52,22 @@ type MatchmakerQueue struct {
 	AssignmentsChan    chan *pb.Roster
 	OtelMeterPtr       *metric.Meter
 	TPC                int64
-	metricsOnce        sync.Once
+	// tpcMutex protects concurrent reads and writes of per-instance TPC and
+	// newTicket across SetTestTicketConfig, GenerateTestTickets, and the OTel
+	// gauge callback so multiple MatchmakerQueue instances remain isolated.
+	tpcMutex                              sync.Mutex
+	newTicket                             func(context.Context) *pb.Ticket
+	metricsOnce                           sync.Once
+	otelTicketAssignments                 metric.Int64Counter
+	otelTicketActivations                 metric.Int64Counter
+	otelTicketActivationFailures          metric.Int64Counter
+	otelTicketCreationRetries             metric.Int64Counter
+	otelTicketCreations                   metric.Int64Counter
+	otelTicketDeletionFailures            metric.Int64Counter
+	otelTicketsGeneratedPerCycle          metric.Int64ObservableGauge
+	otelTicketGenerationsAchievedPerCycle metric.Int64Histogram
+	otelTicketGenerationCycleDurations    metric.Int64Histogram
+	otelTicketQueuedDurations             metric.Float64Histogram
 }
 
 type ClientRequest struct {
@@ -75,19 +85,19 @@ func (q *MatchmakerQueue) ensureMetrics(logger *logrus.Entry) {
 	q.metricsOnce.Do(func() {
 		if q.OtelMeterPtr != nil {
 			logger.Tracef("Initializing otel metrics")
-			registerMetrics(q.OtelMeterPtr)
+			q.registerMetrics(q.OtelMeterPtr)
 			// This inline function is a simple callback that open telemetry uses to read
 			// the current TPC
 			meter := *q.OtelMeterPtr
 			_, err := meter.RegisterCallback(
 				func(ctx context.Context, o metric.Observer) error {
 					// TPC can be updated asynchronously, so we protect reading it with a lock.
-					tpcMutex.Lock()
-					o.ObserveInt64(otelTicketsGeneratedPerCycle, q.TPC)
-					tpcMutex.Unlock()
+					q.tpcMutex.Lock()
+					o.ObserveInt64(q.otelTicketsGeneratedPerCycle, q.TPC)
+					q.tpcMutex.Unlock()
 					return nil
 				},
-				otelTicketsGeneratedPerCycle,
+				q.otelTicketsGeneratedPerCycle,
 			)
 			if err != nil {
 				logger.Fatalf("Failed to set up tpc gauge: %v", err)
@@ -216,7 +226,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				pendingActivations[id] = append(pendingActivations[id], request.ResultChan)
 				pendingMu.Unlock()
 
-				otelTicketCreations.Add(ctx, 1)
+				q.otelTicketCreations.Add(ctx, 1)
 				select {
 				case ticketIdsToActivate <- id:
 				case <-ctx.Done():
@@ -255,7 +265,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 
 				if res.Err != nil {
 					aLogger.WithField("ticket_id", res.TicketId).Errorf("Ticket activation failed: %v", res.Err)
-					otelTicketActivationFailures.Add(ctx, 1)
+					q.otelTicketActivationFailures.Add(ctx, 1)
 					q.Tickets.Delete(res.TicketId)
 					for _, ch := range waiters {
 						ch <- http.StatusInternalServerError
@@ -266,7 +276,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 
 				// Record otelTicketActivations only after confirming res.Err == nil
 				// so failed activations are counted solely under otelTicketActivationFailures.
-				otelTicketActivations.Add(ctx, 1)
+				q.otelTicketActivations.Add(ctx, 1)
 
 				for _, ch := range waiters {
 					ch <- http.StatusOK
@@ -342,15 +352,15 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 					bLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
 					assigned.Store(ticket.GetId(), true)
 					// Update metric
-					otelTicketAssignments.Add(ctx, 1)
+					q.otelTicketAssignments.Add(ctx, 1)
 					// Get diff between now and ticket creation time, in milliseconds
 					queuedDur := time.Now().Sub(ticket.GetAttributes().GetCreationTime().AsTime())
 					// TODO add metric.WithAttributes(attribute.String()) for
 					// useful ways of slicing up the durations in a dashboard
 					// Record queue duration in fractional milliseconds
-					otelTicketQueuedDurations.Record(ctx, float64(queuedDur.Microseconds()/1000))
+					q.otelTicketQueuedDurations.Record(ctx, float64(queuedDur.Microseconds()/1000))
 				} else {
-					otelTicketDeletionFailures.Add(ctx, 1)
+					q.otelTicketDeletionFailures.Add(ctx, 1)
 					if _, previouslyassigned := assigned.Load(ticket.GetId()); previouslyassigned {
 						bLogger.Debugf("PREVIOUSLY ASSIGNED ticket %v assignment: %v", ticket.GetId(), assignment)
 					} else {
@@ -372,17 +382,20 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// SetTPC instructs the test function GenerateTestTickets() to make `newTPC`
-// tickets per second using `ticketCreationFunc()`. Example mock client ticket
-// creations functions can be found in internal/mocks/gameclient
+// SetTestTicketConfig instructs the test function GenerateTestTickets() to make
+// `newTPC` tickets per second using `ticketCreationFunc()` on this
+// MatchmakerQueue instance. Example mock client ticket creation functions can
+// be found in internal/mocks/gameclient.
 func (q *MatchmakerQueue) SetTestTicketConfig(newTPC int64,
 	ticketCreationFunc func(context.Context) *pb.Ticket) {
 
-	// This can be updated at any time by the calling code, so protect it with a mutex
-	tpcMutex.Lock()
+	// Protect per-instance TPC and newTicket updates with q.tpcMutex so callers
+	// can reconfigure ticket generation at any time without racing with
+	// GenerateTestTickets or other MatchmakerQueue instances.
+	q.tpcMutex.Lock()
 	q.TPC = newTPC
-	newTicket = ticketCreationFunc
-	tpcMutex.Unlock()
+	q.newTicket = ticketCreationFunc
+	q.tpcMutex.Unlock()
 }
 
 // Test the queue by generating tickets every second.
@@ -446,15 +459,15 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 				if !durationRecorded {
 					dur = time.Since(startTime)
 					// Record length of the cycle
-					otelTicketGenerationCycleDurations.Record(ctx, dur.Milliseconds())
+					q.otelTicketGenerationCycleDurations.Record(ctx, dur.Milliseconds())
 					durationRecorded = true
 				}
 				// Record successful ticket generations this cycle
-				otelTicketGenerationsAchievedPerCycle.Record(ctx, numTixCreationsAchieved)
+				q.otelTicketGenerationsAchievedPerCycle.Record(ctx, numTixCreationsAchieved)
 
-				tpcMutex.Lock()
+				q.tpcMutex.Lock()
 				reqTPC := q.TPC
-				tpcMutex.Unlock()
+				q.tpcMutex.Unlock()
 
 				// Cycle status log once per cycle
 				tpcLogger.Infof("matchmaker queue ticket creation cycle %010d/%010d: ticket creations %05d/%05d (achieved/requested), time elapsed %.3f/%.3f seconds",
@@ -481,9 +494,9 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 						// its http.Status result so sending on ResultChan never blocks
 						// if the cycle deadline has already elapsed.
 						rChan := make(chan int, 1)
-						tpcMutex.Lock()
-						ticketFunc := newTicket
-						tpcMutex.Unlock()
+						q.tpcMutex.Lock()
+						ticketFunc := q.newTicket
+						q.tpcMutex.Unlock()
 						// Guard the send on deadline.C and ctx.Done() so this goroutine
 						// neither overruns the cycle deadline when ClientRequestChan is
 						// full nor deadlocks if q.Run(ctx) has already exited.
@@ -522,7 +535,7 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 						if !durationRecorded {
 							// no more tickets to create this second, record how long elapsed
 							dur = time.Since(startTime)
-							otelTicketGenerationCycleDurations.Record(ctx, dur.Milliseconds())
+							q.otelTicketGenerationCycleDurations.Record(ctx, dur.Milliseconds())
 							durationRecorded = true
 						}
 					}
@@ -542,9 +555,9 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 		go func(ch chan struct{}) {
 			defer close(ch)
 			// TPC can be updated at any time, so protect it with a mutex.
-			tpcMutex.Lock()
+			q.tpcMutex.Lock()
 			thisTPC := q.TPC
-			tpcMutex.Unlock()
+			q.tpcMutex.Unlock()
 			for i := thisTPC; i > 0; i-- {
 				// Select on cycleCtx.Done() so this producer goroutine immediately
 				// exits when the 1-second cycle deadline fires or ctx is cancelled.
@@ -612,7 +625,7 @@ func (q *MatchmakerQueue) proxyCreateTicket(ctx context.Context, ticket *pb.Tick
 		// TODO: expose max elapsed retry time as a configurable deadline parameter
 		backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)), ctx),
 		func(err error, bo time.Duration) {
-			otelTicketCreationRetries.Add(ctx, 1)
+			q.otelTicketCreationRetries.Add(ctx, 1)
 			logger.Warnf("CreateTicket temporary failure (backoff for %v): %v", err, bo)
 		},
 	)

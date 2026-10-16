@@ -26,28 +26,16 @@ var (
 		"component":      "queue",
 		"implementation": "otel",
 	})
-
-	// Metric variable declarations are global, so they can be accessed directly in the application code.
-	// Metrics populated by the grpc function implementations in main.go.
-	otelTicketAssignments                 otelmetrics.Int64Counter
-	otelTicketActivations                 otelmetrics.Int64Counter
-	otelTicketActivationFailures          otelmetrics.Int64Counter
-	otelTicketCreationRetries             otelmetrics.Int64Counter
-	otelTicketCreations                   otelmetrics.Int64Counter
-	otelTicketDeletionFailures            otelmetrics.Int64Counter
-	otelTicketsGeneratedPerCycle          otelmetrics.Int64ObservableGauge
-	otelTicketGenerationsAchievedPerCycle otelmetrics.Int64Histogram
-	otelTicketGenerationCycleDurations    otelmetrics.Int64Histogram
-	otelTicketQueuedDurations             otelmetrics.Float64Histogram
 )
 
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
-func registerMetrics(meterPointer *otelmetrics.Meter) {
+func (q *MatchmakerQueue) registerMetrics(meterPointer *otelmetrics.Meter) {
 	meter := *meterPointer
 	var err error
 
-	// Initialize all declared Metrics
-	otelTicketsGeneratedPerCycle, err = meter.Int64ObservableGauge(
+	// Initialize all declared Metrics on this MatchmakerQueue instance so
+	// multiple instances can run concurrently without racing on shared globals.
+	q.otelTicketsGeneratedPerCycle, err = meter.Int64ObservableGauge(
 		metricsNamePrefix+"tpc.request",
 		otelmetrics.WithDescription("Number of test tickets generations attempted per cycle (default 1 second)"),
 	)
@@ -55,7 +43,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketQueuedDurations, err = meter.Float64Histogram(
+	q.otelTicketQueuedDurations, err = meter.Float64Histogram(
 		metricsNamePrefix+"ticket.queued_durations",
 		otelmetrics.WithDescription("Length of time spent by tickets in the queue"),
 		otelmetrics.WithUnit("ms"),
@@ -69,7 +57,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	// handles batching internally and streams one per-ticket ActivationResult
 	// back to mmqueue (where recording 1 into a histogram would produce a
 	// degenerate distribution with min=1, max=1, mean=1).
-	otelTicketActivations, err = meter.Int64Counter(
+	q.otelTicketActivations, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.activations",
 		otelmetrics.WithDescription("Total number of tickets activated"),
 	)
@@ -77,7 +65,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketActivationFailures, err = meter.Int64Counter(
+	q.otelTicketActivationFailures, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.activations.failures",
 		otelmetrics.WithDescription("Total number of ticket activations that permanently failed"),
 	)
@@ -85,7 +73,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketGenerationCycleDurations, err = meter.Int64Histogram(
+	q.otelTicketGenerationCycleDurations, err = meter.Int64Histogram(
 		metricsNamePrefix+"ticket.generation.cycle_duration",
 		otelmetrics.WithDescription("Actual duration of ticket creation cycles"),
 		otelmetrics.WithUnit("ms"),
@@ -93,7 +81,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
-	otelTicketGenerationsAchievedPerCycle, err = meter.Int64Histogram(
+	q.otelTicketGenerationsAchievedPerCycle, err = meter.Int64Histogram(
 		metricsNamePrefix+"tpc.actual",
 		otelmetrics.WithDescription("Actual number of tickets successfully created each cycle"),
 	)
@@ -101,7 +89,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketCreations, err = meter.Int64Counter(
+	q.otelTicketCreations, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.creations",
 		otelmetrics.WithDescription("Total tickets created since startup"),
 	)
@@ -109,7 +97,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketCreationRetries, err = meter.Int64Counter(
+	q.otelTicketCreationRetries, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.creation.retries",
 		otelmetrics.WithDescription("Total number of times that ticket creation failed and was retried"),
 	)
@@ -117,7 +105,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketAssignments, err = meter.Int64Counter(
+	q.otelTicketAssignments, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.assignments",
 		otelmetrics.WithDescription("Total ticket assignments received"),
 	)
@@ -125,7 +113,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketDeletionFailures, err = meter.Int64Counter(
+	q.otelTicketDeletionFailures, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.deletion.failures",
 		otelmetrics.WithDescription("Total ticket deletion failures"),
 	)
