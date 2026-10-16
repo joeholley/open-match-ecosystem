@@ -1129,3 +1129,123 @@ func TestInvokeMatchmakingFunctions_LargePayloadAndScannerError(t *testing.T) {
 		}
 	})
 }
+
+// TestPost_CloudRunTokenRefreshedOn403 verifies REL-07:
+//  1. When running on Cloud Run (K_REVISION set) and the server rejects a cached
+//     OIDC ID token with 403 Forbidden (matching om-core's mmfauth.IsAuthRejection),
+//     Post refreshes the cached token from a fresh TokenSource and retries once
+//     with the refreshed token and identical request body.
+//  2. When the refreshed token is also rejected with 403 Forbidden, Post retries
+//     only once (2 total HTTP requests and 2 token mint calls) and returns the
+//     403 response without looping infinitely.
+func TestPost_CloudRunTokenRefreshedOn403(t *testing.T) {
+	t.Setenv("K_REVISION", "test-rev-rel07")
+
+	t.Run("403 Forbidden triggers single OIDC token refresh and succeeds with refreshed token", func(t *testing.T) {
+		var (
+			mu             sync.Mutex
+			receivedAuth   []string
+			receivedBodies []string
+		)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			auth := r.Header.Get("Authorization")
+			mu.Lock()
+			receivedAuth = append(receivedAuth, auth)
+			receivedBodies = append(receivedBodies, string(body))
+			mu.Unlock()
+
+			if auth == "Bearer stale-403-token" {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("IAM token expired or rejected"))
+				return
+			}
+			if auth != "Bearer refreshed-403-token" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ticketId":"1790307871351-403"}`))
+		}))
+		defer srv.Close()
+
+		var factoryCalls atomic.Int32
+		client := newTestOMClient(srv.URL, 10)
+		client.tokens = newIDTokenCache(func(_ context.Context, _ string) (oauth2.TokenSource, error) {
+			n := factoryCalls.Add(1)
+			tok := "stale-403-token"
+			if n >= 2 {
+				tok = "refreshed-403-token"
+			}
+			return &staticTestTokenSource{
+				tok: &oauth2.Token{
+					AccessToken: tok,
+					Expiry:      time.Now().Add(time.Hour),
+				},
+			}, nil
+		})
+
+		id, err := client.CreateTicket(context.Background(), &pb.Ticket{})
+		if err != nil {
+			t.Fatalf("CreateTicket after 403 token refresh failed: %v", err)
+		}
+		if id != "1790307871351-403" {
+			t.Errorf("got ticketId %q, want 1790307871351-403", id)
+		}
+		if got := factoryCalls.Load(); got != 2 {
+			t.Errorf("expected 2 token mint calls (initial + 1 refresh on 403), got %d", got)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		wantAuth := []string{"Bearer stale-403-token", "Bearer refreshed-403-token"}
+		if !slices.Equal(receivedAuth, wantAuth) {
+			t.Errorf("receivedAuth = %v, want %v", receivedAuth, wantAuth)
+		}
+		if len(receivedBodies) != 2 || receivedBodies[0] == "" || receivedBodies[0] != receivedBodies[1] {
+			t.Errorf("expected non-empty identical request body on 403 retry, got %v", receivedBodies)
+		}
+	})
+
+	t.Run("403 Forbidden retries at most once when refreshed token is also rejected", func(t *testing.T) {
+		var hits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("persistent IAM permission denied"))
+		}))
+		defer srv.Close()
+
+		var factoryCalls atomic.Int32
+		client := newTestOMClient(srv.URL, 10)
+		client.tokens = newIDTokenCache(func(_ context.Context, _ string) (oauth2.TokenSource, error) {
+			n := factoryCalls.Add(1)
+			return &staticTestTokenSource{
+				tok: &oauth2.Token{
+					AccessToken: fmt.Sprintf("forbidden-tok-%d", n),
+					Expiry:      time.Now().Add(time.Hour),
+				},
+			}, nil
+		})
+
+		logger := logrus.New()
+		logger.SetOutput(io.Discard)
+		resp, err := client.Post(context.Background(), logrus.NewEntry(logger), srv.URL, "/tickets", []byte(`{}`))
+		if err != nil {
+			t.Fatalf("Post returned unexpected transport error: %v", err)
+		}
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Post status = %d, want %d (http.StatusForbidden)", resp.StatusCode, http.StatusForbidden)
+		}
+		if gotHits := hits.Load(); gotHits != 2 {
+			t.Errorf("expected exactly 2 HTTP requests (initial + 1 retry), got %d", gotHits)
+		}
+		if gotMints := factoryCalls.Load(); gotMints != 2 {
+			t.Errorf("expected exactly 2 token mint calls, got %d", gotMints)
+		}
+	})
+}

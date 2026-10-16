@@ -700,9 +700,12 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, u
 		return nil, err
 	}
 
-	// If the server rejected the cached Cloud Run ID token with 401 Unauthorized,
-	// refresh the token from a fresh TokenSource and retry once.
-	if onCloudRun && token != nil && resp != nil && resp.StatusCode == http.StatusUnauthorized {
+	// If the server rejected the cached Cloud Run ID token with 401 Unauthorized
+	// or 403 Forbidden (matching om-core's mmfauth.IsAuthRejection, which treats
+	// both Unauthenticated and PermissionDenied as Cloud Run IAM auth rejections
+	// when a cached OIDC ID token expires or is invalidated), refresh the token
+	// from a fresh TokenSource and retry once.
+	if onCloudRun && token != nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 		if resp.Body != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
