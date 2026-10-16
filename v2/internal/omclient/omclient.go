@@ -520,6 +520,11 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	// Process the result stream line-by-line. Use bufio.Scanner instead of
 	// fmt.Fscanf("%s\n") because protojson-serialized extensions may contain
 	// spaces inside JSON string values.
+	// Raise bufio.Scanner's maximum token size from the 64 KiB default
+	// (bufio.MaxScanTokenSize) to 10 MiB because om-core supports streamed MMF
+	// responses up to 4 MiB in protobuf, which can expand significantly when
+	// serialized as a single newline-delimited JSON line with base64-encoded
+	// google.protobuf.Any extensions.
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
@@ -585,7 +590,11 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 			return
 		}
 	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+	// scanner.Scan() returns false both on clean EOF (where scanner.Err() is nil)
+	// and on stream read or token errors (such as bufio.ErrTooLong or a mid-stream
+	// network failure). Check ctx.Err() == nil so expected context cancellation
+	// does not log a spurious stream read error.
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
 		logger.Errorf("Error reading stream, closing: %v", err)
 	}
 }

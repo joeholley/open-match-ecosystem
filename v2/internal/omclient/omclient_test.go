@@ -15,6 +15,7 @@
 package omclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -908,6 +909,223 @@ func TestInvokeMatchmakingFunctions_MidStreamErrorEnvelope(t *testing.T) {
 		}
 		if count != 0 {
 			t.Errorf("expected 0 matches on 503 response, got %d", count)
+		}
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type failingStreamBody struct {
+	firstLine []byte
+	readOnce  bool
+	readErr   error
+}
+
+func (b *failingStreamBody) Read(p []byte) (int, error) {
+	if !b.readOnce {
+		b.readOnce = true
+		n := copy(p, b.firstLine)
+		return n, nil
+	}
+	return 0, b.readErr
+}
+
+func (b *failingStreamBody) Close() error { return nil }
+
+// TestInvokeMatchmakingFunctions_LargePayloadAndScannerError verifies REL-02:
+//  1. A streamed StreamedMmfResponse whose JSON line exceeds bufio.MaxScanTokenSize
+//     (64 KiB) is parsed and delivered intact via the 10 MiB scanner buffer,
+//     followed by subsequent matches on the same stream.
+//  2. When scanner.Scan() terminates due to a non-EOF stream error while ctx is
+//     still active (ctx.Err() == nil), InvokeMatchmakingFunctions logs
+//     "Error reading stream, closing".
+//  3. When ctx is cancelled mid-stream after receiving a match,
+//     InvokeMatchmakingFunctions exits cleanly without logging a spurious
+//     "Error reading stream, closing" error.
+func TestInvokeMatchmakingFunctions_LargePayloadAndScannerError(t *testing.T) {
+	t.Run("large match response exceeding 64 KiB default scanner limit is delivered intact", func(t *testing.T) {
+		// Construct a match whose serialized JSON line is ~256 KiB (4x the 64 KiB
+		// bufio.MaxScanTokenSize default).
+		const numTickets = 256
+		largeTickets := make([]*pb.Ticket, numTickets)
+		padding := strings.Repeat("x", 1024)
+		for i := range numTickets {
+			largeTickets[i] = &pb.Ticket{
+				Id: fmt.Sprintf("1790000000000-%d", i),
+				Attributes: &pb.Ticket_FilterableData{
+					Tags: []string{padding},
+				},
+			}
+		}
+		largeMatch := &pb.Match{
+			Id: "match-large-256k",
+			Rosters: map[string]*pb.Roster{
+				"roster-large": {
+					Name:    "roster-large",
+					Tickets: largeTickets,
+				},
+			},
+		}
+		largeBytes, err := protojson.Marshal(&pb.StreamedMmfResponse{Match: largeMatch})
+		if err != nil {
+			t.Fatalf("protojson.Marshal(largeMatch): %v", err)
+		}
+		if len(largeBytes) <= 4*bufio.MaxScanTokenSize {
+			t.Fatalf("expected serialized largeMatch size > %d bytes, got %d", 4*bufio.MaxScanTokenSize, len(largeBytes))
+		}
+		followUpBytes, err := protojson.Marshal(&pb.StreamedMmfResponse{Match: &pb.Match{Id: "match-after-large"}})
+		if err != nil {
+			t.Fatalf("protojson.Marshal(followUpMatch): %v", err)
+		}
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(largeBytes))
+			_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(followUpBytes))
+		}))
+		defer srv.Close()
+
+		var logBuf bytes.Buffer
+		cfg := viper.New()
+		cfg.Set("OM_CORE_ADDR", srv.URL)
+		logger := logrus.New()
+		logger.SetOutput(&logBuf)
+		client := New(cfg, logger, srv.Client())
+
+		respChan := make(chan *pb.StreamedMmfResponse, 4)
+		client.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{
+			Profile: &pb.Profile{Name: "large-profile"},
+		}, respChan)
+
+		var gotMatches []*pb.Match
+		for res := range respChan {
+			if res != nil && res.GetMatch() != nil {
+				gotMatches = append(gotMatches, res.GetMatch())
+			}
+		}
+
+		if len(gotMatches) != 2 {
+			t.Fatalf("received %d matches, want 2 (log output: %s)", len(gotMatches), logBuf.String())
+		}
+		if gotMatches[0].GetId() != "match-large-256k" {
+			t.Errorf("first match ID = %q, want \"match-large-256k\"", gotMatches[0].GetId())
+		}
+		if gotTickets := len(gotMatches[0].GetRosters()["roster-large"].GetTickets()); gotTickets != numTickets {
+			t.Errorf("first match ticket count = %d, want %d", gotTickets, numTickets)
+		}
+		if gotMatches[1].GetId() != "match-after-large" {
+			t.Errorf("second match ID = %q, want \"match-after-large\"", gotMatches[1].GetId())
+		}
+		if strings.Contains(logBuf.String(), "Error reading stream, closing") {
+			t.Errorf("unexpected stream error logged on clean large stream:\n%s", logBuf.String())
+		}
+	})
+
+	t.Run("scanner error when context is active is logged", func(t *testing.T) {
+		m1Bytes, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: &pb.Match{Id: "match-before-stream-err"}})
+		firstLine := fmt.Appendf(nil, `{"result":%s}`+"\n", string(m1Bytes))
+
+		httpClient := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: &failingStreamBody{
+						firstLine: firstLine,
+						readErr:   errors.New("simulated mid-stream read failure"),
+					},
+					Request: req,
+				}, nil
+			}),
+		}
+
+		var logBuf bytes.Buffer
+		cfg := viper.New()
+		cfg.Set("OM_CORE_ADDR", "http://om-core.example.internal")
+		logger := logrus.New()
+		logger.SetOutput(&logBuf)
+		client := New(cfg, logger, httpClient)
+
+		respChan := make(chan *pb.StreamedMmfResponse, 4)
+		client.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{
+			Profile: &pb.Profile{Name: "err-profile"},
+		}, respChan)
+
+		var gotIDs []string
+		for res := range respChan {
+			if res != nil && res.GetMatch() != nil {
+				gotIDs = append(gotIDs, res.GetMatch().GetId())
+			}
+		}
+
+		if !slices.Equal(gotIDs, []string{"match-before-stream-err"}) {
+			t.Errorf("received match IDs = %v, want [\"match-before-stream-err\"]", gotIDs)
+		}
+		if !strings.Contains(logBuf.String(), "Error reading stream, closing") ||
+			!strings.Contains(logBuf.String(), "simulated mid-stream read failure") {
+			t.Errorf("expected \"Error reading stream, closing\" with underlying error in logs, got:\n%s", logBuf.String())
+		}
+	})
+
+	t.Run("context cancellation mid-stream does not log spurious scanner error", func(t *testing.T) {
+		releaseHandlerCh := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			m1Bytes, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: &pb.Match{Id: "match-before-cancel"}})
+			_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(m1Bytes))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-releaseHandlerCh
+		}))
+		defer srv.Close()
+		defer close(releaseHandlerCh)
+
+		var logBuf bytes.Buffer
+		cfg := viper.New()
+		cfg.Set("OM_CORE_ADDR", srv.URL)
+		logger := logrus.New()
+		logger.SetOutput(&logBuf)
+		client := New(cfg, logger, srv.Client())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		respChan := make(chan *pb.StreamedMmfResponse)
+		doneCh := make(chan struct{})
+		go func() {
+			defer close(doneCh)
+			client.InvokeMatchmakingFunctions(ctx, &pb.MmfRequest{
+				Profile: &pb.Profile{Name: "cancel-profile"},
+			}, respChan)
+		}()
+
+		select {
+		case res := <-respChan:
+			if res.GetMatch().GetId() != "match-before-cancel" {
+				t.Fatalf("first match ID = %q, want \"match-before-cancel\"", res.GetMatch().GetId())
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for first streamed match before cancel")
+		}
+
+		// Cancel ctx while the server stream is still open and blocked in scanner.Scan().
+		cancel()
+
+		select {
+		case <-doneCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for InvokeMatchmakingFunctions to exit after ctx cancel")
+		}
+
+		if strings.Contains(logBuf.String(), "Error reading stream, closing") {
+			t.Errorf("expected no spurious \"Error reading stream, closing\" log on context cancellation, got:\n%s", logBuf.String())
 		}
 	})
 }
