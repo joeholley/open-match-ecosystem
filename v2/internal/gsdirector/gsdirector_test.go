@@ -1708,3 +1708,131 @@ func TestMockDirectorRun_AssignmentTTLExpiresAllTicketsInMultiTicketRoster(t *te
 	assertHistSumEquals("gsdirector.ticket.rejections.assigned", 0)
 	assertHistSumEquals("gsdirector.ticket.assignments", 8)
 }
+
+type failingAssignmentSender struct {
+	onFirstSend func()
+	attempts    int
+	mu          sync.Mutex
+}
+
+func (s *failingAssignmentSender) Send(_ context.Context, _ *pb.Roster) error {
+	s.mu.Lock()
+	s.attempts++
+	first := s.attempts == 1
+	s.mu.Unlock()
+	if first && s.onFirstSend != nil {
+		s.onFirstSend()
+	}
+	return fmt.Errorf("simulated transient assignment publish error")
+}
+
+func (s *failingAssignmentSender) Stop() {}
+
+// TestMockDirectorRun_AssignmentPublisherBackoffRespectsContextCancellation
+// verifies that MockDirector.Run wraps the AssignmentPublisher.Send retry
+// backoff in backoff.WithContext(..., ctx) (gsdirector.go:1583-1593) so
+// cancelling ctx during a failed Send aborts the retry loop immediately rather
+// than sleeping through the 5-second MaxElapsedTime window.
+func TestMockDirectorRun_AssignmentPublisherBackoffRespectsContextCancellation(t *testing.T) {
+	rand.Seed(1) //nolint:staticcheck // gsdirector.go uses top-level math/rand.Intn
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	const (
+		testReqHash   = "hash-backoff-cancel"
+		baseAllocSpec = `{"spec":"backoff-cancel"}`
+	)
+	hashAny, err := anypb.New(&knownpb.StringValue{Value: testReqHash})
+	if err != nil {
+		t.Fatalf("anypb.New(hash): %v", err)
+	}
+	allocAny, err := anypb.New(&knownpb.StringValue{Value: baseAllocSpec})
+	if err != nil {
+		t.Fatalf("anypb.New(alloc): %v", err)
+	}
+
+	gsMgr := &trackingGSManager{
+		requests: []*pb.MmfRequest{
+			{
+				Mmfs: []*pb.MatchmakingFunctionSpec{Fifo},
+				Profile: &pb.Profile{
+					Name: "fleet.soloduel.backoff",
+					Extensions: map[string]*anypb.Any{
+						ex.MMFRequestHashKey: hashAny,
+						ex.AgonesAllocatorKey: allocAny,
+					},
+				},
+			},
+		},
+		allocatedMatches: make(map[string]string),
+		updatedSpecs:     make(map[string]*pb.MmfRequest),
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tickets:activate":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case "/matches:fetch":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			m := &pb.Match{
+				Id: "match-backoff-cancel",
+				Rosters: map[string]*pb.Roster{
+					"r1": {Tickets: []*pb.Ticket{{Id: "t-backoff-1"}}},
+				},
+				Extensions: map[string]*anypb.Any{
+					ex.MMFRequestHashKey: hashAny,
+				},
+			}
+			raw, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: m})
+			_, _ = fmt.Fprintf(w, `{"result":%s}`+"\n", string(raw))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := viper.New()
+	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("NUM_MM_CYCLES", 1)
+	cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 0)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 0)
+	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+	cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	var cancelAt time.Time
+	sender := &failingAssignmentSender{
+		onFirstSend: func() {
+			cancelAt = time.Now()
+			cancel()
+		},
+	}
+
+	d := &MockDirector{
+		OmClient:            omclient.New(cfg, log, srv.Client()),
+		GSManager:           gsMgr,
+		AssignmentPublisher: sender,
+		Cfg:                 cfg,
+		Log:                 log,
+		OtelMeterPtr:        testMeter(),
+	}
+
+	d.Run(ctx)
+
+	sender.mu.Lock()
+	gotAttempts := sender.attempts
+	sender.mu.Unlock()
+
+	if gotAttempts != 1 {
+		t.Errorf("AssignmentPublisher.Send attempts = %d after ctx cancel on first attempt, want 1", gotAttempts)
+	}
+	if elapsed := time.Since(cancelAt); elapsed > 500*time.Millisecond {
+		t.Errorf("MockDirector.Run took %v after ctx cancel in AssignmentPublisher.Send backoff, want < 500ms (vs 5s MaxElapsedTime)", elapsed)
+	}
+}

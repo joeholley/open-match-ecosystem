@@ -36,6 +36,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -360,12 +361,25 @@ func main() {
 			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
 		}
 	}
+	// Track the queue and director goroutines in a WaitGroup so graceful shutdown
+	// can wait for both to finish after ctx is cancelled before stopping the
+	// assignment receiver and publisher.
+	var runWg sync.WaitGroup
+
 	// Start the ticket matchmaking queue. This is where tickets get processd and stored in OM2.
-	go q.Run(ctx)
+	runWg.Add(1)
+	go func() {
+		defer runWg.Done()
+		q.Run(ctx)
+	}()
 
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
-	go d.Run(ctx)
+	runWg.Add(1)
+	go func() {
+		defer runWg.Done()
+		d.Run(ctx)
+	}()
 
 	// Return the latest matchmaking cycle status on exact GET / requests ("GET /{$}"
 	// in Go 1.22+ ServeMux matches only the root path "/" and not arbitrary subpaths).
@@ -463,10 +477,11 @@ func main() {
 		}
 	}()
 
-	// Wait for quit signal, then cancel ctx first so background loops (q.Run,
-	// d.Run, q.GenerateTestTickets, and in-process MMF servers) stop issuing work.
+	// Wait for quit signal, then cancel ctx and wait for q.Run(ctx) and d.Run(ctx)
+	// to exit before stopping the assignment receiver and publisher.
 	<-signalChan
 	cancel()
+	runWg.Wait()
 	receiver.Stop()
 	publisher.Stop()
 	// Pass a fresh bounded context to srv.Shutdown rather than the already-cancelled

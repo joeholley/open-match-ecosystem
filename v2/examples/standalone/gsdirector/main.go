@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -244,9 +245,15 @@ func main() {
 		}
 	}
 
-	// Start the director. This is where profiles get sent to the InvokeMMFs()
-	// call, and matches returned.
-	go d.Run(ctx)
+	// Start the director and track it in a WaitGroup so graceful shutdown waits
+	// for d.Run(ctx) to finish sending any in-flight assignments before calling
+	// publisher.Stop().
+	var runWg sync.WaitGroup
+	runWg.Add(1)
+	go func() {
+		defer runWg.Done()
+		d.Run(ctx)
+	}()
 
 	// Return the latest matchmaking cycle status on exact GET / requests ("GET /{$}"
 	// in Go 1.22+ ServeMux matches only the root path "/" and not arbitrary subpaths).
@@ -264,10 +271,11 @@ func main() {
 		}
 	}()
 
-	// Wait for quit signal, then cancel ctx first so d.Run stops its matchmaking
-	// loop before shutting down the assignment publisher and HTTP server.
+	// Wait for quit signal, then cancel ctx and wait for d.Run(ctx) to exit
+	// before shutting down the assignment publisher and HTTP server.
 	<-signalChan
 	cancel()
+	runWg.Wait()
 	publisher.Stop()
 	// Pass a fresh bounded context to srv.Shutdown rather than the already-cancelled
 	// application ctx so in-flight HTTP requests have a grace period to complete.

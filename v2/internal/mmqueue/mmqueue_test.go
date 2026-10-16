@@ -37,6 +37,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
@@ -47,32 +48,8 @@ func testMeter() *metric.Meter {
 	return &m
 }
 
-// syncChannelReceiver implements assignmentdistributor.Receiver by blocking on
-// the caller goroutine until ctx is cancelled or assignmentsChan is closed.
-// This ensures MatchmakerQueue.Run's WaitGroup waits for all in-flight
-// assignmentHandler invocations to complete before Run returns.
-type syncChannelReceiver struct {
-	assignmentsChan <-chan *pb.Roster
-}
-
-func (r *syncChannelReceiver) Receive(ctx context.Context, handler func(ctx context.Context, roster *pb.Roster)) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case roster, ok := <-r.assignmentsChan:
-			if !ok {
-				return nil
-			}
-			handler(ctx, roster)
-		}
-	}
-}
-
-func (r *syncChannelReceiver) Stop() {}
-
 // newTestQueue constructs a MatchmakerQueue wired to the given mock om-core URL
-// and a synchronous channel-backed assignment receiver.
+// and a synchronous channel-backed assignmentdistributor.ChannelReceiver.
 func newTestQueue(omCoreURL string, maxConcurrentCreates int, maxActivationBatch int) (*MatchmakerQueue, chan *pb.Roster) {
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", omCoreURL)
@@ -88,7 +65,7 @@ func newTestQueue(omCoreURL string, maxConcurrentCreates int, maxActivationBatch
 		Cfg:                cfg,
 		Log:                log,
 		ClientRequestChan:  make(chan *ClientRequest, 64),
-		AssignmentReceiver: &syncChannelReceiver{assignmentsChan: assignmentsChan},
+		AssignmentReceiver: assignmentdistributor.NewChannelReceiver(assignmentsChan),
 		AssignmentsChan:    assignmentsChan,
 		OtelMeterPtr:       testMeter(),
 	}

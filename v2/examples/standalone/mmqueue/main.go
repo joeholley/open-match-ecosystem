@@ -68,6 +68,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -219,8 +220,14 @@ func main() {
 			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
 		}
 	}
-	// Start the queue. This is where requests are processed and added to Open Match.
-	go q.Run(ctx)
+	// Start the queue and track it in a WaitGroup so graceful shutdown waits for
+	// q.Run(ctx) to finish before calling receiver.Stop().
+	var runWg sync.WaitGroup
+	runWg.Add(1)
+	go func() {
+		defer runWg.Done()
+		q.Run(ctx)
+	}()
 
 	// Handler for client matchmaking requests (registered on both /tickets to
 	// match examples/matchmaker and / for backward compatibility).
@@ -315,10 +322,11 @@ func main() {
 		}
 	}()
 
-	// Wait for quit signal, then cancel ctx first so q.Run stops processing new
-	// ticket batches before shutting down the assignment receiver and HTTP server.
+	// Wait for quit signal, then cancel ctx and wait for q.Run(ctx) to exit
+	// before shutting down the assignment receiver and HTTP server.
 	<-signalChan
 	cancel()
+	runWg.Wait()
 	receiver.Stop()
 	// Pass a fresh bounded context to srv.Shutdown rather than the already-cancelled
 	// application ctx so in-flight HTTP requests have a grace period to complete.

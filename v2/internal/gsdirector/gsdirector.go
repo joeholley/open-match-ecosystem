@@ -1576,7 +1576,9 @@ func (d *MockDirector) Run(ctx context.Context) {
 					// Give the assignment to this roster
 					roster.Assignment = assignment
 
-					// Attempt to send this roster assignment
+					// Attempt to send this roster assignment. Wrap the exponential backoff
+					// policy in backoff.WithContext so retries abort immediately if ctx is
+					// cancelled during director shutdown.
 					var err error
 					err = backoff.RetryNotify(
 						func() error {
@@ -1584,7 +1586,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 							err := d.AssignmentPublisher.Send(ctx, roster)
 							return err
 						},
-						backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
+						backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)), ctx),
 						func(err error, bo time.Duration) {
 							d.Log.Warnf("Sending match session assignment temporary failure (backoff for %v): %v", err, bo)
 						},
