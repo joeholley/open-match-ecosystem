@@ -111,8 +111,8 @@ func main() {
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 	// Default MAX_CONCURRENT_TICKET_CREATIONS to 500 so high-TPC workloads can
 	// saturate om-core's outgoing replication batch threshold
-	// (OM_CACHE_OUT_MAX_QUEUE_THRESHOLD=100) without stalling behind its 250ms
-	// batch wait timer (OM_CACHE_OUT_WAIT_TIMEOUT_MS=250).
+	// (OM_CACHE_OUT_MAX_QUEUE_THRESHOLD=50) without stalling behind its 500ms
+	// batch wait timer (OM_CACHE_OUT_WAIT_TIMEOUT_MS=500).
 	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 500)
 	// Test ticket load generation config (defaults INITIAL_TPC to 0 in the
 	// standalone queue so synthetic tickets are only generated when opted into
