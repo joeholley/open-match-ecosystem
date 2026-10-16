@@ -25,7 +25,7 @@ Step #1: [builder] 2025/08/27 06:00:39 [DEBUG] GET https://go.dev/dl/?mode=json
 Step #1: [builder] ***** CACHE MISS: "go"
 Step #1: [builder] Installing Go v1.24.6.
 ```
-use the lower of these two versions (typically the pack builder lags behind) in the `go.mod` files in Open Match 2 related projects using `go mod edit -go=<VERSION>` (currently Go `1.25+` in [`go.mod`](go.mod)). This is to ensure that users following the instructions to build in their own projects can do their own builds using the default Cloud Shell environment and the latest Google Cloud buildpacks.
+use the lower of these two versions (typically the pack builder lags behind) in the `go.mod` files in Open Match 2 related projects using `go mod edit -go=<VERSION>` (currently Go `1.26+` in [`go.mod`](go.mod)). This is to ensure that users following the instructions to build in their own projects can do their own builds using the default Cloud Shell environment and the latest Google Cloud buildpacks.
 * After verifying that the build works with the latest dependencies, commit any changes to `go.mod` to the repo.
 
 ## Build

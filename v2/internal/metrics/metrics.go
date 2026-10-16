@@ -30,6 +30,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
+// ServiceVersion is the default OpenTelemetry service.version resource
+// attribute reported for the ecosystem matchmaker services.
+const ServiceVersion = "2.1.0"
+
 var (
 	otelLogger = logrus.WithFields(logrus.Fields{
 		"app":            "matchmaker",
@@ -58,7 +62,7 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
 			semconv.ServiceNameKey.String("example"),
-			semconv.ServiceVersionKey.String("2.0.0"),
+			semconv.ServiceVersionKey.String(ServiceVersion),
 		),
 		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
 		resource.WithFromEnv(),
@@ -103,7 +107,7 @@ func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Con
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
 			semconv.ServiceNameKey.String("queue"),
-			semconv.ServiceVersionKey.String("2.0.0"),
+			semconv.ServiceVersionKey.String(ServiceVersion),
 		),
 		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
 		resource.WithFromEnv(),
