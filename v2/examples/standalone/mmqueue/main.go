@@ -50,12 +50,21 @@
 //   - Creates queued tickets in Open Match (POST /tickets -> receive TicketID in
 //     response). These TicketIDs need to be activated before they are available
 //     for matching.
-//   - Stores the ClientID to TicketID mapping. This mapping can be kept local
-//     to this process (not scalable, not persistent, not highly available), but
-//     it is recommended that it is stored in a player status service instead.
-//   - POST batches of TicketIDs to the /tickeds:activate endpoint to mark those
-//     tickets as available for matching.
+//   - POST batches of TicketIDs to the /tickets:activate endpoint to mark those
+//     tickets as available for matching, and reports the result back to the
+//     waiting client request.
+//   - If a client goes away before its ticket is active, skips creating the
+//     ticket or deactivates it (DELETE /tickets:deactivate), so that player
+//     isn't matched.
+//   - Receives match assignments from the director (over Pub/Sub). This
+//     example only records them in metrics and logs; a real platform would
+//     deliver each assignment to the right player, typically by keeping the
+//     player -> TicketID mapping in a player status service rather than in
+//     this process.
 //
+// To run it locally (listens on PORT 8082 by default; see README.md):
+//
+// LOGGING_FORMAT=text LOGGING_LEVEL=debug OTEL_SIDECAR=false GCP_PROJECT_ID=<project> ASSIGNMENT_TOPIC_ID=<topic> go run .
 
 package main
 
@@ -63,13 +72,10 @@ import (
 	"context"
 	"math"
 	"net/http"
-	// revive: blank-imports — pprof registers profiling HTTP handlers via side-effect import.
-	// revive:disable-next-line:blank-imports
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -101,22 +107,43 @@ var (
 )
 
 func main() {
+	// run() returns instead of calling os.Exit/logger.Fatal directly so that
+	// its deferred cleanup (metrics flush) always runs.
+	os.Exit(run())
+}
+
+func run() int {
 
 	// Quit this process on the signals sent by kubernetes/knative/Cloud Run/ctrl+c.
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
-	ctx, cancel := context.WithCancel(context.Background())
+	// This is set up first so that a SIGTERM during startup (e.g. while
+	// waiting on the om-core connection check) also stops the process.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	// ctx is cancelled either by a signal or explicitly during shutdown, and
+	// stops all background work.
+	ctx, cancel := context.WithCancel(sigCtx)
 	defer cancel()
 
 	// Read config
 	cfg := viper.New()
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
+	// Per-attempt timeout for unary om-core calls (CreateTicket,
+	// ActivateTickets, DeactivateTickets, ValidateConnection).
+	cfg.SetDefault("OM_CORE_REQUEST_TIMEOUT_MS", 5000)
+	// Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL, or om-core rejects
+	// every activation call.
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+	cfg.SetDefault("OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS", 10)
 	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 500)
 	cfg.SetDefault("INITIAL_TPC", 0)
 	cfg.SetDefault("TICKET_CREATION_CYCLE_DURATION_MS", 1000)
 	cfg.SetDefault("TICKET_CREATION_CYCLES", math.MaxInt32)
-	cfg.SetDefault("PORT", 8080)
+	cfg.SetDefault("TICKET_ARRIVAL_SEED", 0) // 0 = random seed each run
+	// How long the queue tracks a ticket before treating it as expired in
+	// om-core. Keep it equal to om-core's OM_CACHE_TICKET_TTL_MS.
+	cfg.SetDefault("MMQUEUE_TICKET_TTL_MS", 600000)
+	// Cloud Run injects PORT. The local default avoids om-core's default 8080.
+	cfg.SetDefault("PORT", 8082)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -132,11 +159,13 @@ func main() {
 	// Assignment distribution config
 	// Returning assignments via channel only works if the mmqueue and the
 	// gsdirector are running in the same process, so you'll need to provide a
-	// different assignment return data flow.  We sugest using a distributed
+	// different assignment return data flow.  We suggest using a distributed
 	// message bus, pub/sub system, or your platform service's notification
 	// service when returning assignments.
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "pubsub")
 	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
+	// The Pub/Sub TOPIC the director publishes assignments to. Each mmqueue
+	// instance creates (and deletes on shutdown) its own subscription to it.
 	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
 
 	// Read overrides from env vars
@@ -146,17 +175,57 @@ func main() {
 	log := logging.NewSharedLogger(cfg)
 	logger := log.WithFields(logrus.Fields{"component": "matchmaking_queue"})
 
+	initialTPC := cfg.GetInt64("INITIAL_TPC")
+	if initialTPC < 0 || initialTPC > 10000 {
+		logger.Errorf("INITIAL_TPC must be between 0 and 10000 (the same limits as the /tpc endpoint), got %d", initialTPC)
+		return 1
+	}
+
 	// Initialize Metrics
 	if cfg.GetBool("OTEL_SIDECAR") {
-		meterptr, otelShutdownFunc = metrics.InitializeOtel()
+		meterptr, otelShutdownFunc = metrics.InitializeOtel("mmqueue")
 	} else {
-		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"), "mmqueue")
 	}
-	defer func() {
-		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Flushing metrics is called explicitly during shutdown (before the slow
+	// Pub/Sub cleanup), and deferred here in case run() returns early.
+	flushMetrics := sync.OnceFunc(func() {
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer flushCancel()
-		_ = otelShutdownFunc(flushCtx)
-	}()
+		if err := otelShutdownFunc(flushCtx); err != nil {
+			logger.Errorf("Failed to flush metrics: %v", err)
+		}
+	})
+	defer flushMetrics()
+
+	omClient := omclient.New(
+		cfg,
+		log,
+		&http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        500,              // Maximum idle connections to keep open
+				MaxIdleConnsPerHost: 500,              // Maximum idle connections per host
+				IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+				DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+			},
+			Timeout: 30 * time.Second,
+		},
+	)
+
+	// Check the om-core connection once, before creating anything that needs
+	// cleaning up (the Pub/Sub subscription). Any failure is fatal: a queue
+	// that can't reach om-core can't do anything useful.
+	validateCtx, validateCancel := context.WithTimeout(ctx, 10*time.Second)
+	err := omClient.ValidateConnection(validateCtx, cfg.GetString("OM_CORE_ADDR"))
+	validateCancel()
+	if err != nil {
+		logger.Errorf("Unable to reach om-core at OM_CORE_ADDR=%q: %v. "+
+			"Check that om-core is running and OM_CORE_ADDR is its exact URL "+
+			"(on Cloud Run: the service's https:// URL, and this service's "+
+			"identity needs the Cloud Run Invoker role on om-core).",
+			cfg.GetString("OM_CORE_ADDR"), err)
+		return 1
+	}
 
 	// Initialize assignment distribution
 	var receiver assignmentdistributor.Receiver
@@ -175,29 +244,22 @@ func main() {
 		// make a unique topic subscription.
 		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
 
-		// Instantiate the Pub/Sub receiver
-		receiver = assignmentdistributor.NewPubSubSubscriber(
+		// Instantiate the Pub/Sub receiver. On failure the constructor logs
+		// the error; returning 1 here exits through run()'s deferred cleanup.
+		var err error
+		receiver, err = assignmentdistributor.NewPubSubSubscriber(
 			cfg.GetString("GCP_PROJECT_ID"),
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
 		)
+		if err != nil {
+			return 1
+		}
 	}
 
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
-		OmClient: omclient.New(
-			cfg,
-			log,
-			&http.Client{
-				Transport: &http.Transport{
-					MaxIdleConns:        500,              // Maximum idle connections to keep open
-					MaxIdleConnsPerHost: 500,              // Maximum idle connections per host
-					IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
-					DisableKeepAlives:   false,            // Make sure keep-alives are enabled
-				},
-				Timeout: 30 * time.Second,
-			},
-		),
+		OmClient:           omClient,
 		Cfg:                cfg,
 		Log:                log,
 		ClientRequestChan:  make(chan *mmqueue.ClientRequest),
@@ -205,15 +267,6 @@ func main() {
 		OtelMeterPtr:       meterptr,
 	}
 
-	//Check connection before spinning everything up.
-	err := q.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
-	if err != nil {
-		logger.Errorf("OM Connection test failure: %v", err)
-		if strings.Contains(err.Error(), "connect: connection refused") {
-			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
-			os.Exit(1)
-		}
-	}
 	// Start the queue. This is where requests are processed and added to Open Match.
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -222,11 +275,19 @@ func main() {
 		q.Run(ctx)
 	}()
 
-	// Handler for client matchmaking requests
-	handleTicketRequest := func(w http.ResponseWriter, r *http.Request) {
+	// Each server gets its own ServeMux, so the app endpoints are only served
+	// on PORT (and /metrics only on the Prometheus port).
+	mux := http.NewServeMux()
+
+	// Handler for client matchmaking requests. Creating a ticket changes
+	// state, so only POST is accepted.
+	mux.HandleFunc("POST /tickets", func(w http.ResponseWriter, r *http.Request) {
 		// Make a channel on which the queue will return its http.Status result
 		resultChan := make(chan int, 1)
 		req := &mmqueue.ClientRequest{
+			// If the client goes away before the ticket is active, the
+			// queue skips or deactivates it so the player isn't matched.
+			Ctx:        r.Context(),
 			ResultChan: resultChan,
 			Ticket: func(r *http.Request) *pb.Ticket {
 				// In a real game client, you'd probably use whatever communication
@@ -237,7 +298,7 @@ func main() {
 				//
 				// This example uses the provided internal library to generate a simple
 				// ticket with a few example attributes for testing.
-				return mockClientTicket(ctx)
+				return mockClientTicket(r.Context())
 			}(r),
 		}
 
@@ -247,34 +308,45 @@ func main() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		case <-r.Context().Done():
-			w.WriteHeader(http.StatusRequestTimeout)
+			// The client went away; nobody is listening for a response.
 			return
 		}
 
-		// Write the http.Status code returned by the queue
+		// Write the http.Status code returned by the queue: 200 (created and
+		// activated), 502 (om-core call failed) or 503 (shutting down). The
+		// queue closes resultChan without a value if it abandoned the request
+		// because the client went away.
 		select {
-		case status := <-resultChan:
-			w.WriteHeader(status)
+		case status, ok := <-resultChan:
+			if ok {
+				w.WriteHeader(status)
+			}
+		case <-ctx.Done():
+			// Shutting down; don't wait for the queue.
+			w.WriteHeader(http.StatusServiceUnavailable)
 		case <-r.Context().Done():
-			w.WriteHeader(http.StatusRequestTimeout)
+			// The client went away; nobody is listening for a response.
 		}
-	}
-	http.HandleFunc("/tickets", handleTicketRequest)
-	http.HandleFunc("/", handleTicketRequest)
+	})
 
 	// FOR TESTING ONLY
 	// Asynchronous goroutine that loops TICKET_CREATION_CYCLES number of
 	// times, attempting to queue the given number of tickets each cycle.
 	// Update the tpc by sending an http GET to /tpc/<NUM> as per the handler
 	// below.
-	q.SetTestTicketConfig(cfg.GetInt64("INITIAL_TPC"), mockClientTicket)
-	go q.GenerateTestTickets(ctx)
+	q.SetTestTicketConfig(initialTPC, mockClientTicket)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		q.GenerateTestTickets(ctx)
+	}()
 
 	// Handler to update the (best effort) number of test tickets we want to
-	// generate and put into the queue per second. If the requested TPC is more
-	// than the matchmaker can manage in a second, it will do as many as it
-	// can. Set it to 0 to stop automatically creating tickets.
-	http.HandleFunc("/tpc/{tixPerCycle}", func(w http.ResponseWriter, r *http.Request) {
+	// generate and put into the queue each ticket creation cycle
+	// (TICKET_CREATION_CYCLE_DURATION_MS). If the requested TPC is more than
+	// the matchmaker can manage in a cycle, it will do as many as it can. Set
+	// it to 0 to stop automatically creating tickets.
+	mux.HandleFunc("/tpc/{tixPerCycle}", func(w http.ResponseWriter, r *http.Request) {
 		// Attempt to convert requested TPC string into an int64
 		rTPC, err := strconv.ParseInt(r.PathValue("tixPerCycle"), 10, 64)
 		if err != nil {
@@ -282,38 +354,100 @@ func main() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		// Hard cap of 10k per second and reject negative values to protect against mistyped http requests
+		// Hard cap of 10k per cycle and reject negative values to protect against mistyped http requests
 		if rTPC < 0 || rTPC > 10000 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		// Update tixPerSec number, and generate tickets using the gameclient.Simple function.
+		// Update tixPerCycle number, and generate tickets using the gameclient.Simple function.
 		q.SetTestTicketConfig(rTPC, mockClientTicket)
 
 		logger.Infof("TPC set to %v", rTPC)
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// Profiling endpoints, mounted explicitly on this server's mux. The
+	// example deployment only allows internal, authenticated traffic (Cloud
+	// Run --ingress internal --no-allow-unauthenticated). Don't expose these
+	// on an internet-facing port.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
 	// Start http server.
 	logger.Infof("PORT %v detected", cfg.GetString("PORT"))
-	srv := &http.Server{Addr: ":" + cfg.GetString("PORT")}
+	srv := &http.Server{
+		Addr:              ":" + cfg.GetString("PORT"),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	srvErr := make(chan error, 1)
 	go func() {
 		// ErrServerClosed is the error returned by http.Server on graceful exit.
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			logger.Fatal(err)
+			srvErr <- err
 		}
 	}()
 
-	// Wait for quit signal
-	<-signalChan
+	// Wait for a quit signal or for the HTTP server to fail.
+	exitCode := 0
+	select {
+	case <-sigCtx.Done():
+		logger.Info("Shutdown signal received")
+	case err := <-srvErr:
+		logger.Errorf("HTTP server failed: %v", err)
+		exitCode = 1
+	}
+
+	// Restore default signal handling, so a second SIGINT/SIGTERM (e.g. an
+	// impatient ctrl+c) kills the process instead of waiting for shutdown.
+	stopSignals()
+
+	// Shutdown budget: Cloud Run sends SIGTERM and kills the container ~10s
+	// later, so each step is bounded and the most important work goes first:
+	//   1. cancel ctx: stops background work (ticket generation, queue) and
+	//      makes waiting /tickets handlers answer 503
+	//   2. stop accepting HTTP requests, let in-flight ones finish   (<= 1s)
+	//   3. wait for background work to stop                          (<= 3s)
+	//   4. flush metrics, so the end of an E2E run is recorded       (<= 2s)
+	//   5. delete this instance's Pub/Sub subscription               (<= 3s)
 	cancel()
-	wg.Wait()
-	receiver.Stop()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 1*time.Second)
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Fatal(err)
+		logger.Errorf("HTTP server shutdown: %v", err)
+	}
+	shutdownCancel()
+
+	if !waitWithTimeout(3*time.Second, wg.Wait) {
+		logger.Error("Timed out waiting for background work to stop")
+	}
+
+	flushMetrics()
+
+	if !waitWithTimeout(3*time.Second, receiver.Stop) {
+		logger.Error("Timed out stopping assignment distribution; the Pub/Sub subscription may need to be deleted manually")
 	}
 	logger.Info("Exiting...")
+	return exitCode
+}
+
+// waitWithTimeout runs fn and waits up to d for it to return. It reports
+// whether fn finished in time; if it didn't, fn keeps running in the
+// background until the process exits.
+func waitWithTimeout(d time.Duration, fn func()) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }

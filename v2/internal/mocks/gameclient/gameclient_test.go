@@ -31,22 +31,30 @@ func TestSimple(t *testing.T) {
 			t.Fatalf("iteration %d: expected non-nil ticket attributes", i)
 		}
 
-		crTime := attrs.GetCreationTime()
-		if crTime == nil || !crTime.IsValid() || crTime.AsTime().IsZero() {
-			t.Fatalf("iteration %d: invalid CreationTime: %v", i, crTime)
+		// The queue, not the client, sets CreationTime; no pool uses tags.
+		if attrs.GetCreationTime() != nil {
+			t.Fatalf("iteration %d: got CreationTime %v, want unset (set by the queue)", i, attrs.GetCreationTime())
+		}
+		if tags := attrs.GetTags(); len(tags) != 0 {
+			t.Fatalf("iteration %d: got tags %v, want none", i, tags)
 		}
 
-		tags := attrs.GetTags()
-		if len(tags) != 1 || tags[0] == "" {
-			t.Fatalf("iteration %d: got tags %v, want 1 non-empty tag", i, tags)
-		}
-
-		ping, ok := attrs.GetDoubleArgs()["ping.asia-northeast1-a"]
+		mmr, ok := attrs.GetDoubleArgs()["mmr"]
 		if !ok {
-			t.Fatalf("iteration %d: missing ping.asia-northeast1-a in DoubleArgs", i)
+			t.Fatalf("iteration %d: missing mmr in DoubleArgs", i)
 		}
-		if ping < 20 || ping >= 120 {
-			t.Fatalf("iteration %d: got ping %v, want in [20, 120)", i, ping)
+		if mmr < 500 || mmr > 2750 {
+			t.Fatalf("iteration %d: got mmr %v, want in [500, 2750]", i, mmr)
+		}
+		hasZonePing := false
+		for k, v := range attrs.GetDoubleArgs() {
+			if len(k) > 5 && k[:5] == "ping." && v >= 20 && v <= 100 {
+				hasZonePing = true
+				break
+			}
+		}
+		if !hasZonePing {
+			t.Fatalf("iteration %d: expected at least one ping.<zone> in [20, 100], got %v", i, attrs.GetDoubleArgs())
 		}
 
 		class, ok := attrs.GetStringArgs()["class"]

@@ -42,6 +42,8 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -91,7 +93,7 @@ func New() *mmfServer {
 	}
 }
 
-// New instantiates the MMF Server using the provided logger and adds default
+// NewWithLogger instantiates the MMF Server using the provided logger and adds default
 // structured logging fields
 func NewWithLogger(l *logrus.Logger) *mmfServer {
 	return &mmfServer{
@@ -109,7 +111,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	// Use the helper function to reconstruct the incoming request from partial
 	// 'chunked' requests.
-	req, err := server.GetChunkedRequest(stream)
+	req, err := server.GetChunkedRequest(stream, s.logger)
 	if err != nil {
 		s.logger.Errorf("error getting chunked request: %v", err)
 		return err
@@ -118,7 +120,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	// Process tickets for the pools specified in the Match Profile.  In this
 	// example fifo matching strategy, any player can be matched with any other
-	// player, so just concatinate all the pools together.
+	// player, so just concatenate all the pools together.
 	tickets := []*pb.Ticket{}
 	seenTickets := make(map[string]struct{})
 	for pname, pool := range req.GetPools() {
@@ -137,7 +139,28 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	}
 	s.logger.Debugf("Matching among %v tickets from %v provided pools", len(tickets), len(req.GetPools()))
 
-	t := time.Now().Format("2006-01-02T15:04:05.00")
+	// om-core makes no guarantee about the order of tickets in a pool (they
+	// come from an unordered snapshot of its ticket cache), and the pools map
+	// above is iterated in random order. To actually be first-in-first-out,
+	// sort by ticket creation time, oldest first. Break ties on ticket ID so
+	// the result is deterministic.
+	slices.SortFunc(tickets, func(a, b *pb.Ticket) int {
+		if c := a.GetAttributes().GetCreationTime().AsTime().Compare(b.GetAttributes().GetCreationTime().AsTime()); c != 0 {
+			return c
+		}
+		return strings.Compare(a.GetId(), b.GetId())
+	})
+
+	// Match IDs follow the reverse-DNS convention described below:
+	// "<mmf name>.<base profile name>.<unique suffix>". Everything before the
+	// last dot has bounded cardinality, so it can be used as a metric
+	// attribute. Matches made from a backfill profile keep the "backfill."
+	// prefix in their IDs so they're easy to tell apart in logs.
+	baseProfileName := server.BaseProfileName(req.GetName())
+	matchIDPrefix := matchName + "." + baseProfileName
+	if strings.HasPrefix(req.GetName(), server.BackfillProfilePrefix) {
+		matchIDPrefix = matchName + "." + server.BackfillProfilePrefix + baseProfileName
+	}
 
 	// Retrieve custom parameters we put into the request profile. If they
 	// don't exist, we just fall back to the defaults declared in the const
@@ -157,6 +180,10 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	if err == nil && exMinRosterLen > 0 {
 		minRosterLen = exMinRosterLen
 	}
+	// The game server director puts the number of ready game servers that can
+	// host matches from this profile in this extension. Making more matches
+	// than that is wasted work (the director would have nowhere to put them),
+	// so stop there. If the extension is missing, there's no limit.
 	maxMatches := math.MaxInt32
 	exMaxMatches, err := extensions.Int32(req.GetExtensions(), extensions.AgonesGSReadyCountKey)
 	if err == nil && exMaxMatches > 0 {
@@ -166,12 +193,25 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	matchNum := 0
 
 	// Continue as long as there are enough tickets left to make the desired
-	// number of rosters of the requested minmum length
+	// number of rosters of the requested minimum length
 	for len(tickets) >= (minRosterLen*desiredNumRosters) && matchNum < maxMatches {
+		// om-core cancels this stream when its OM_MMF_TIMEOUT_SECS deadline
+		// passes. There's no point making more matches nobody will read.
+		if err := stream.Context().Err(); err != nil {
+			s.logger.Warnf("Stopping after %v matches, stream context done: %v", matchNum, err)
+			return err
+		}
+
 		matchExtensions := maps.Clone(req.GetExtensions())
 		if matchExtensions == nil {
 			matchExtensions = make(map[string]*anypb.Any)
 		}
+
+		// Unique suffix for this match: invocation start time plus match
+		// number. It contains no dots, so stripping everything after the
+		// last dot of the match ID (or of a backfill profile name built from
+		// it) leaves only bounded-cardinality text.
+		uniqueSuffix := fmt.Sprintf("%d-%d", startTime.UnixNano(), matchNum)
 
 		match := &pb.Match{
 			// Make a unique Match ID.
@@ -184,7 +224,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 			// unique hashes, etc in the part of the profile name _after_ the last
 			// dot.
 			// https://grafana.com/blog/2022/02/15/what-are-cardinality-spikes-and-why-do-they-matter/
-			Id: fmt.Sprintf("profile-%s.time-%s-num-%d", matchName, t, matchNum),
+			Id: matchIDPrefix + "." + uniqueSuffix,
 			// Initialize empty roster map.
 			Rosters: make(map[string]*pb.Roster),
 			// It is best practice to copy all extensions in the profile over
@@ -206,8 +246,9 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		indexedRosterNames := make([]string, 0, desiredNumRosters)
 		for rosterNum := 1; rosterNum <= desiredNumRosters; rosterNum++ {
 
-			// Generate a unique roster name.
-			rosterName := fmt.Sprintf("%v.%v_roster%04d", matchName, matchNum, rosterNum)
+			// Generate a roster name that is unique across matches, not
+			// just within this one, by deriving it from the match ID.
+			rosterName := fmt.Sprintf("%v-roster%04d", match.GetId(), rosterNum)
 
 			// Add this roster name to a list of rosters. This allows us to
 			// easily iterate over them when adding tickets, filling the
@@ -256,7 +297,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 				// In a real MMF, you'd probably evaluate how well matched the
 				// tickets you selected are, and assign a quality 'score' for
 				// this match. This can then be sent back to your matchmaker
-				// using the pb.Match.Extensions field, so it an decide if this
+				// using the pb.Match.Extensions field, so it can decide if this
 				// match is better or worse than others.
 				score = 100
 				break
@@ -301,21 +342,39 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 				updatedExtensions = make(map[string]*anypb.Any)
 			}
 			updatedProfile := &pb.Profile{
-				// Name this as a backfill profile so we can see it clearly in logs/metrics.
-				Name:       "backfill." + match.GetId(),
+				// Name this as a backfill profile so we can see it clearly in
+				// logs/metrics: "backfill.<base profile name>.<unique suffix>".
+				// The game server director recognizes backfill profiles by
+				// the "backfill." prefix, and strips everything after the
+				// last dot (only the unique suffix) before using the name as
+				// a metric attribute, which keeps metric cardinality bounded.
+				Name:       server.BackfillProfilePrefix + baseProfileName + "." + uniqueSuffix,
 				Pools:      updatedPools,
 				Extensions: updatedExtensions,
 			}
-			// Next time this profile is used for matching, we will only
-			// request as many tickets as we have empty slots in the rosters.
-			remainingRostersCapacity := desiredRosterLen - lowestRosterLen(match)
-			updatedProfile.Extensions["desiredRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(remainingRostersCapacity)})
+			// Next time this profile is used for matching, request only as
+			// many tickets as this match has empty slots. The backfill asks
+			// for a single roster holding every open slot, rather than
+			// desiredNumRosters rosters of equal size: when rosters are
+			// uneven (e.g. 2 teams of 4 with 4 and 3 players), equal-sized
+			// rosters would either ask for too many players (overfilling the
+			// server) or too few. Which team each new player joins is left
+			// to the game server.
+			openSlots := 0
+			for _, roster := range match.GetRosters() {
+				openSlots += desiredRosterLen - len(roster.GetTickets())
+			}
+			updatedProfile.Extensions["desiredNumRosters"], err = anypb.New(&knownpb.Int32Value{Value: 1})
+			if err != nil {
+				s.logger.Errorf("Unable to set desiredNumRosters on the backfill profile for match %v", match.Id)
+			}
+			updatedProfile.Extensions["desiredRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(openSlots)})
 			if err != nil {
 				s.logger.Errorf("Unable to update the desiredRosterLen to reflect ticket capacity of match %v",
 					match.Id)
 			}
-			if remainingRostersCapacity < minRosterLen {
-				updatedProfile.Extensions["minRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(remainingRostersCapacity)})
+			if openSlots < minRosterLen {
+				updatedProfile.Extensions["minRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(openSlots)})
 				if err != nil {
 					s.logger.Errorf("Unable to update the minRosterLen to reflect ticket capacity of match %v",
 						match.Id)
@@ -355,7 +414,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		// Stream the generated match back to Open Match.
 		err = stream.Send(&pb.StreamedMmfResponse{Match: match})
 		if err != nil {
-			s.logger.Debugf("Failed to stream proposal to Open Match, got %s", err.Error())
+			s.logger.Warnf("Failed to stream proposal to Open Match, got %s", err.Error())
 			return err
 		}
 
@@ -368,7 +427,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	return nil
 }
 
-// lowestRosterLength returns the length of the roster with the lowest number of tickets in it.
+// lowestRosterLen returns the length of the roster with the lowest number of tickets in it.
 func lowestRosterLen(match *pb.Match) (length int) {
 	length = math.MaxInt32
 	for _, roster := range match.Rosters {
@@ -379,8 +438,8 @@ func lowestRosterLen(match *pb.Match) (length int) {
 	return
 }
 
-// rosterLengthsLessThan returns true if all pb.Roster.Tickets slices in the provided
-// match have fewer than 'length' tickets in them.
+// rosterLengthsLessThan returns true if any pb.Roster.Tickets slice in the
+// provided match has fewer than 'length' tickets in it.
 func rosterLengthsLessThan(match *pb.Match, length int) bool {
 	if lowestRosterLen(match) < length {
 		return true

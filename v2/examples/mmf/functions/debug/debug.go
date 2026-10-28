@@ -19,6 +19,13 @@
 // InvokeMatchmakingFunctions is sorting and filtering the tickets in the way
 // you expected.
 //
+// It also returns a single match with no rosters whose extensions carry a
+// small analysis of the profile (the number of tickets in each pool). om-core
+// forwards ticketless matches to the InvokeMatchmakingFunctions caller without
+// deactivating anything, so this is a way for an MMF to send information
+// back to the game server director, which should treat it as feedback rather
+// than as a match proposal.
+//
 // This sample is a reference to demonstrate the usage of an mmf as a general
 // tool for accessing tickets in Open Match and doing things _other_ than
 // matching those tickets.  For more details about this pattern, have a look at
@@ -35,7 +42,6 @@ package debug
 import (
 	"fmt"
 	"maps"
-	"math"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -49,6 +55,11 @@ import (
 
 const (
 	matchName = "profile-debug-matchfunction"
+
+	// The returned match has one Int32Value extension per pool in the
+	// profile, at this prefix + the pool name, holding the number of tickets
+	// om-core put in that pool.
+	poolTicketCountKeyPrefix = "debug.pool-ticket-count/"
 )
 
 var (
@@ -79,7 +90,7 @@ func New() *mmfServer {
 	}
 }
 
-// New instantiates the MMF Server using the provided logger and adds default
+// NewWithLogger instantiates the MMF Server using the provided logger and adds default
 // structured logging fields
 func NewWithLogger(l *logrus.Logger) *mmfServer {
 	return &mmfServer{
@@ -93,11 +104,10 @@ func NewWithLogger(l *logrus.Logger) *mmfServer {
 func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	startTime := time.Now()
-	t := time.Now().Format("2006-01-02T15:04:05.00")
 
 	// Use the helper function to reconstruct the incoming request from partial
 	// 'chunked' requests.
-	req, err := server.GetChunkedRequest(stream)
+	req, err := server.GetChunkedRequest(stream, s.logger)
 	if err != nil {
 		s.logger.Errorf("error getting chunked request: %v", err)
 		return err
@@ -123,7 +133,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 			}
 			// Including and then printing other data types as extensions are
 			// possible, but you will need to write the code to cast the
-			// anypb.Any and retreive the value for it yourself (the extentions
+			// anypb.Any and retrieve the value for it yourself (the extensions
 			// module only provides functions to handle that for the above
 			// three data types).
 		}
@@ -147,7 +157,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 			s.logger.Infof("  +Filter     |  String at key %v = %v", filter.GetStringArg(), filter.GetValue())
 		}
 		for _, filter := range pool.GetTagPresentFilters() {
-			s.logger.Infof(" +Filter     |  Tag %v exists", filter.GetTag())
+			s.logger.Infof("  +Filter     |  Tag %v exists", filter.GetTag())
 		}
 
 		// Print the extensions in the pool.
@@ -160,9 +170,13 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	}
 
 	// Example of how to pass ticket analysis back to the game server director:
-	// just make an empty match with some extension fields you pre-defined, and
-	// return it.  Then, add code to your director to read those extension
-	// fields and use the data in them as desired.
+	// make a match with no rosters, put your analysis in extension fields
+	// you've agreed on with the director, and return it. om-core forwards
+	// every MMF response to the InvokeMatchmakingFunctions caller, including
+	// matches with no tickets; since there are no tickets, it has nothing to
+	// deactivate. The director should read those extension fields and treat
+	// a ticketless match as feedback, never as a match proposal to allocate
+	// a game server for.
 	match := &pb.Match{
 		// Make a unique Match ID.
 		//
@@ -174,7 +188,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		// unique hashes, etc in the part of the profile name _after_ the last
 		// dot.
 		// https://grafana.com/blog/2022/02/15/what-are-cardinality-spikes-and-why-do-they-matter/
-		Id: fmt.Sprintf("profile-%s.time-%s", matchName, t),
+		Id: fmt.Sprintf("%s.%s.%d", matchName, server.BaseProfileName(req.GetName()), startTime.UnixNano()),
 		// Initialize empty roster map.
 		Rosters: make(map[string]*pb.Roster),
 		// It is best practice to copy all extensions in the profile over
@@ -193,24 +207,25 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		s.logger.Errorf("Unable to create 'profileName' extension for match %v", match.Id)
 	}
 
-	// Set the quality 'score' of this match to a flag value, so the game
-	// server director knows it should never be used to allocate a server.
-	var score int32
-	score = math.MinInt32
-	match.Extensions["score"], err = anypb.New(&knownpb.Int32Value{Value: score})
-	if err != nil {
-		s.logger.Errorf("Unable to create 'score' extension for match %v", match.Id)
+	// The analysis itself: how many tickets om-core put in each pool. A real
+	// diagnostic MMF might return histograms of ticket attributes, wait
+	// times, etc.
+	for pname, pool := range req.GetPools() {
+		match.Extensions[poolTicketCountKeyPrefix+pname], err = anypb.New(&knownpb.Int32Value{Value: int32(len(pool.GetParticipants().GetTickets()))})
+		if err != nil {
+			s.logger.Errorf("Unable to create ticket count extension for pool %v: %v", pname, err)
+		}
 	}
 
-	// Stream the generated match back to Open Match.
+	// Stream the analysis back to Open Match.
 	err = stream.Send(&pb.StreamedMmfResponse{Match: match})
 	if err != nil {
-		s.logger.Debugf("Failed to stream proposal to Open Match, got %s", err.Error())
+		s.logger.Warnf("Failed to stream analysis to Open Match, got %s", err.Error())
 		return err
 	}
 
 	dur := time.Since(startTime)
-	s.logger.Infof("Completed debug of incoming profile in  %.03f seconds", float64(dur.Milliseconds())/1000.0)
+	s.logger.Infof("Completed debug of incoming profile in %.03f seconds", float64(dur.Milliseconds())/1000.0)
 
 	return nil
 }

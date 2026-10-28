@@ -22,6 +22,50 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+func TestCombine(t *testing.T) {
+	one, err := anypb.New(wrapperspb.Int32(1))
+	if err != nil {
+		t.Fatalf("failed to pack: %v", err)
+	}
+	two, err := anypb.New(wrapperspb.Int32(2))
+	if err != nil {
+		t.Fatalf("failed to pack: %v", err)
+	}
+
+	t.Run("b wins on conflicts and inputs are not mutated", func(t *testing.T) {
+		a := map[string]*anypb.Any{"shared": one, "onlyA": one}
+		b := map[string]*anypb.Any{"shared": two, "onlyB": two}
+		got := Combine(a, b)
+
+		if len(got) != 3 || got["shared"] != two || got["onlyA"] != one || got["onlyB"] != two {
+			t.Errorf("Combine = %v, want shared=2 onlyA=1 onlyB=2", got)
+		}
+		if len(a) != 2 || a["shared"] != one {
+			t.Errorf("Combine mutated its first argument: %v", a)
+		}
+		if len(b) != 2 {
+			t.Errorf("Combine mutated its second argument: %v", b)
+		}
+		// Writing to the result must not write through to an input.
+		got["new"] = one
+		if _, ok := a["new"]; ok {
+			t.Errorf("result shares storage with first argument")
+		}
+	})
+
+	t.Run("nil inputs", func(t *testing.T) {
+		if got := Combine(nil, nil); got == nil || len(got) != 0 {
+			t.Errorf("Combine(nil, nil) = %v, want empty non-nil map", got)
+		}
+		if got := Combine(nil, map[string]*anypb.Any{"k": one}); len(got) != 1 {
+			t.Errorf("Combine(nil, b) = %v, want 1 entry", got)
+		}
+		if got := Combine(map[string]*anypb.Any{"k": one}, nil); len(got) != 1 {
+			t.Errorf("Combine(a, nil) = %v, want 1 entry", got)
+		}
+	})
+}
+
 func TestBool(t *testing.T) {
 	trueAny, err := anypb.New(wrapperspb.Bool(true))
 	if err != nil {

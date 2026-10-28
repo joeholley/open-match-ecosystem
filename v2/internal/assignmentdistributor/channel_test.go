@@ -262,3 +262,24 @@ func TestChannelSenderStopUnblocksAndConcurrentRace(t *testing.T) {
 		}
 	}
 }
+
+// The caller owns the channel: ChannelSender.Stop must not close it, so the
+// owner can still use (or close) it without panicking.
+func TestChannelSenderStopDoesNotCloseCallerChannel(t *testing.T) {
+	ch := make(chan *pb.Roster, 1)
+	sender := NewChannelSender(ch)
+	sender.Stop()
+
+	if err := sender.Send(context.Background(), &pb.Roster{Name: "after-stop"}); !errors.Is(err, ErrSenderStopped) {
+		t.Fatalf("Send after Stop returned %v, want %v", err, ErrSenderStopped)
+	}
+	select {
+	case r := <-ch:
+		t.Fatalf("stopped sender sent roster %v", r)
+	default:
+	}
+
+	// Would panic if Stop had closed ch.
+	ch <- &pb.Roster{Name: "owner-send"}
+	close(ch)
+}

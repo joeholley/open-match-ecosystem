@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -211,7 +212,7 @@ func TestActivateTicketsWithResults_PartialInternalFailureSubsetRetry(t *testing
 	inChan <- "ticket-3"
 	close(inChan)
 
-	ctx := context.WithValue(context.Background(), "activationType", "activate")
+	ctx := WithActivationType(context.Background(), "activate")
 	done := make(chan struct{})
 	go func() {
 		rc.ActivateTicketsWithResults(ctx, inChan, resChan)
@@ -285,7 +286,7 @@ func TestActivateTicketsWithResults_InvalidArgumentNonRetry(t *testing.T) {
 		inChan <- "bad-id"
 		close(inChan)
 
-		ctx := context.WithValue(context.Background(), "activationType", "activate")
+		ctx := WithActivationType(context.Background(), "activate")
 		rc.ActivateTicketsWithResults(ctx, inChan, resChan)
 		close(resChan)
 
@@ -327,7 +328,7 @@ func TestActivateTicketsWithResults_InvalidArgumentNonRetry(t *testing.T) {
 		inChan <- "bad-2"
 		close(inChan)
 
-		ctx := context.WithValue(context.Background(), "activationType", "activate")
+		ctx := WithActivationType(context.Background(), "activate")
 		rc.ActivateTicketsWithResults(ctx, inChan, resChan)
 		close(resChan)
 
@@ -385,7 +386,7 @@ func TestActivateTicketsWithResults_MixedInvalidArgumentAndInternalOn400(t *test
 	inChan <- "transient-id"
 	close(inChan)
 
-	ctx := context.WithValue(context.Background(), "activationType", "activate")
+	ctx := WithActivationType(context.Background(), "activate")
 	rc.ActivateTicketsWithResults(ctx, inChan, resChan)
 	close(resChan)
 
@@ -446,7 +447,7 @@ func TestActivateTicketsWithResults_BatchTicketIDDeduplication(t *testing.T) {
 	}
 	close(inChan)
 
-	ctx := context.WithValue(context.Background(), "activationType", "activate")
+	ctx := WithActivationType(context.Background(), "activate")
 	rc.ActivateTicketsWithResults(ctx, inChan, resChan)
 	close(resChan)
 
@@ -492,7 +493,7 @@ func TestActivateTicketsWithResults_Transient503WholeBatchRetry(t *testing.T) {
 	inChan <- "t-200"
 	close(inChan)
 
-	ctx := context.WithValue(context.Background(), "activationType", "activate")
+	ctx := WithActivationType(context.Background(), "activate")
 	rc.ActivateTicketsWithResults(ctx, inChan, resChan)
 	close(resChan)
 
@@ -548,7 +549,7 @@ func TestActivateTicketsWithResults_ClosedInputChannelWithoutEmptyTicketID(t *te
 	inChan <- "ticket-b"
 	close(inChan)
 
-	ctx := context.WithValue(context.Background(), "activationType", "activate")
+	ctx := WithActivationType(context.Background(), "activate")
 	rc.ActivateTicketsWithResults(ctx, inChan, resChan)
 	close(resChan)
 
@@ -828,9 +829,9 @@ func TestValidateConnection_StatusCodes(t *testing.T) {
 	})
 }
 
-// 12. InvokeMatchmakingFunctions Mid-Stream Error and Empty Envelope Handling
+// 12. InvokeMatchmakingFunctions forwards every response and returns stream errors
 func TestInvokeMatchmakingFunctions_MidStreamErrorAndEmptyEnvelope(t *testing.T) {
-	t.Run("mid-stream error and empty result envelope skipped while valid matches delivered", func(t *testing.T) {
+	t.Run("every response forwarded, including one with no match; stream error returned", func(t *testing.T) {
 		match1JSON, _ := protojson.Marshal(&pb.StreamedMmfResponse{
 			Match: &pb.Match{Id: "match-1"},
 		})
@@ -842,20 +843,26 @@ func TestInvokeMatchmakingFunctions_MidStreamErrorAndEmptyEnvelope(t *testing.T)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprintf(w, "{\"result\":%s}\n", string(match1JSON))
-			_, _ = fmt.Fprintln(w, `{"error":{"code":13,"message":"mid-stream internal mmf failure"}}`)
 			_, _ = fmt.Fprintln(w, `{"result":{}}`)
 			_, _ = fmt.Fprintf(w, "{\"result\":%s}\n", string(match2JSON))
+			// om-core reports MMF failures as a final error message.
+			_, _ = fmt.Fprintln(w, `{"error":{"code":13,"message":"1 of 2 matchmaking functions failed: mmf-b: boom"}}`)
 		}))
 		defer srv.Close()
 
 		rc, logBuf := newTestClient(t, srv.URL)
 		respChan := make(chan *pb.StreamedMmfResponse, 10)
-		rc.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{}, respChan)
+		err := rc.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{}, respChan)
 
 		var gotMatchIDs []string
+		noMatch := 0
 		for resp := range respChan {
-			if resp == nil || resp.GetMatch() == nil {
-				t.Fatalf("expected non-nil match on respChan, got %#v", resp)
+			if resp == nil {
+				t.Fatal("respChan must never receive a nil response")
+			}
+			if resp.GetMatch() == nil {
+				noMatch++
+				continue
 			}
 			gotMatchIDs = append(gotMatchIDs, resp.GetMatch().GetId())
 		}
@@ -863,12 +870,59 @@ func TestInvokeMatchmakingFunctions_MidStreamErrorAndEmptyEnvelope(t *testing.T)
 		if !slices.Equal(gotMatchIDs, []string{"match-1", "match-2"}) {
 			t.Fatalf("expected [match-1 match-2], got %v", gotMatchIDs)
 		}
-		if !strings.Contains(logBuf.String(), "mid-stream internal mmf failure") {
-			t.Fatalf("expected mid-stream error message to be logged, got logs: %s", logBuf.String())
+		if noMatch != 1 {
+			t.Fatalf("expected the response with no match to be forwarded once, got %d", noMatch)
+		}
+		if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "mmf-b: boom") {
+			t.Fatalf("expected the stream's Internal error to be returned, got %v", err)
+		}
+		if !strings.Contains(logBuf.String(), "mmf-b: boom") {
+			t.Fatalf("expected stream error message to be logged, got logs: %s", logBuf.String())
 		}
 	})
 
-	t.Run("non-200 HTTP response drains body and closes respChan", func(t *testing.T) {
+	t.Run("successful stream returns nil", func(t *testing.T) {
+		matchJSON, _ := protojson.Marshal(&pb.StreamedMmfResponse{Match: &pb.Match{Id: "ok"}})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, "{\"result\":%s}\n", string(matchJSON))
+		}))
+		defer srv.Close()
+
+		rc, _ := newTestClient(t, srv.URL)
+		respChan := make(chan *pb.StreamedMmfResponse, 4)
+		if err := rc.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{}, respChan); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if n := len(respChan); n != 1 {
+			t.Fatalf("expected 1 response, got %d", n)
+		}
+	})
+
+	t.Run("non-200 HTTP response returns om-core's status and closes respChan", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"code":14,"message":"initial ticket cache replication catch-up did not complete in time"}`))
+		}))
+		defer srv.Close()
+
+		rc, _ := newTestClient(t, srv.URL)
+		respChan := make(chan *pb.StreamedMmfResponse, 4)
+		err := rc.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{}, respChan)
+
+		var count int
+		for range respChan {
+			count++
+		}
+		if count != 0 {
+			t.Fatalf("expected 0 streamed responses on non-200 HTTP status, got %d", count)
+		}
+		if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "catch-up") {
+			t.Fatalf("expected om-core's Unavailable status to be returned, got %v", err)
+		}
+	})
+
+	t.Run("non-200 HTTP response with a non-status body still returns an error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("internal server error"))
@@ -877,14 +931,11 @@ func TestInvokeMatchmakingFunctions_MidStreamErrorAndEmptyEnvelope(t *testing.T)
 
 		rc, _ := newTestClient(t, srv.URL)
 		respChan := make(chan *pb.StreamedMmfResponse, 4)
-		rc.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{}, respChan)
-
-		var count int
+		err := rc.InvokeMatchmakingFunctions(context.Background(), &pb.MmfRequest{}, respChan)
 		for range respChan {
-			count++
 		}
-		if count != 0 {
-			t.Fatalf("expected 0 streamed responses on non-200 HTTP status, got %d", count)
+		if err == nil || !strings.Contains(err.Error(), "internal server error") {
+			t.Fatalf("expected an error carrying the response body, got %v", err)
 		}
 	})
 }
@@ -1019,12 +1070,14 @@ func TestInvokeMatchmakingFunctions_LargePayloadAndScannerErrorSuppression(t *te
 		defer close(unblockServer)
 
 		rc, logBuf := newTestClient(t, srv.URL)
-		ctx, cancel := context.WithCancel(context.Background())
+		errCycleTimeout := errors.New("test MMF cycle timeout")
+		ctx, cancel := context.WithCancelCause(context.Background())
 		respChan := make(chan *pb.StreamedMmfResponse)
 
 		done := make(chan struct{})
+		var invokeErr error
 		go func() {
-			rc.InvokeMatchmakingFunctions(ctx, &pb.MmfRequest{}, respChan)
+			invokeErr = rc.InvokeMatchmakingFunctions(ctx, &pb.MmfRequest{}, respChan)
 			close(done)
 		}()
 
@@ -1037,100 +1090,381 @@ func TestInvokeMatchmakingFunctions_LargePayloadAndScannerErrorSuppression(t *te
 			t.Fatal("timed out waiting for first match")
 		}
 
-		cancel()
+		cancel(errCycleTimeout)
 		for range respChan {
 		}
 		<-done
 
+		if !errors.Is(invokeErr, errCycleTimeout) {
+			t.Fatalf("expected returned error to wrap the context cause, got %v", invokeErr)
+		}
 		if strings.Contains(logBuf.String(), "Error reading stream, closing") {
 			t.Fatalf("expected scanner error log to be suppressed on context cancellation, got logs: %s", logBuf.String())
 		}
 	})
 }
 
-// 14. Cloud Run OIDC Token Refresh on HTTP 403
-func TestPost_CloudRunOIDCTokenRefreshOn403(t *testing.T) {
-	t.Run("403 triggers single refresh and succeeds on retry", func(t *testing.T) {
-		var attempts atomic.Int32
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if attempts.Add(1) == 1 {
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = w.Write([]byte("forbidden"))
-				return
+// countingTokenFactory returns a token factory that mints "<prefix>-<n>"
+// tokens and counts how many times it was called.
+func countingTokenFactory(prefix string, calls *atomic.Int32) tokenSourceFactory {
+	return func(ctx context.Context, audience string) (oauth2.TokenSource, error) {
+		n := calls.Add(1)
+		return &staticTokenSource{
+			token: &oauth2.Token{
+				AccessToken: fmt.Sprintf("%s-%d", prefix, n),
+				Expiry:      time.Now().Add(time.Hour),
+			},
+		}, nil
+	}
+}
+
+// 14. Cloud Run OIDC: HTTP 403 is not retried with a new token, because a
+// missing IAM invoker role isn't fixed by refreshing the token.
+func TestPost_CloudRunOIDC403NotRetried(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden"))
+	}))
+	defer srv.Close()
+
+	rc, _ := newTestClient(t, srv.URL)
+	rc.Cfg.Set("K_REVISION", "test-rev-403")
+	var mintCalls atomic.Int32
+	rc.tokenCache = newOIDCTokenCache(countingTokenFactory("token-403", &mintCalls))
+
+	resp, err := rc.Post(context.Background(), srv.URL, "/tickets:activate", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Post returned unexpected transport error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected HTTP 403 to be returned to the caller, got %d", resp.StatusCode)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("expected 1 HTTP attempt (no retry on 403), got %d", got)
+	}
+	if got := mintCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 token mint (no refresh on 403), got %d", got)
+	}
+}
+
+// Cloud Run OIDC: the audience and URL ignore a trailing "/" on OM_CORE_ADDR.
+func TestPost_TrailingSlashNormalised(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	rc, _ := newTestClient(t, srv.URL+"/")
+	rc.Cfg.Set("K_REVISION", "test-rev-slash")
+	var audience atomic.Value
+	rc.tokenCache = newOIDCTokenCache(func(ctx context.Context, aud string) (oauth2.TokenSource, error) {
+		audience.Store(aud)
+		return &staticTokenSource{token: &oauth2.Token{AccessToken: "tok", Expiry: time.Now().Add(time.Hour)}}, nil
+	})
+
+	resp, err := rc.Post(context.Background(), rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Post failed: %v", err)
+	}
+	resp.Body.Close()
+	if gotPath != "/tickets" {
+		t.Fatalf("expected path /tickets, got %q", gotPath)
+	}
+	if got, _ := audience.Load().(string); got != srv.URL {
+		t.Fatalf("expected audience %q, got %q", srv.URL, got)
+	}
+}
+
+// Cloud Run OIDC: a hung token mint fails the request when its context ends
+// instead of blocking it forever.
+func TestPost_TokenMintBoundedByContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	rc, _ := newTestClient(t, srv.URL)
+	rc.Cfg.Set("K_REVISION", "test-rev-hang")
+	unblock := make(chan struct{})
+	defer close(unblock)
+	rc.tokenCache = newOIDCTokenCache(func(ctx context.Context, aud string) (oauth2.TokenSource, error) {
+		<-unblock
+		return nil, errors.New("unblocked")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := rc.Post(ctx, srv.URL, "/tickets", []byte(`{}`))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded from hung token mint, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Post took %v; expected it to give up when the context expired", elapsed)
+	}
+}
+
+// The Authorization header is never written to the logs, even at trace level.
+func TestPost_AuthorizationHeaderRedacted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	rc, logBuf := newTestClient(t, srv.URL)
+	rc.Log.SetLevel(logrus.TraceLevel)
+	rc.Cfg.Set("K_REVISION", "test-rev-redact")
+	rc.tokenCache = newOIDCTokenCache(func(ctx context.Context, aud string) (oauth2.TokenSource, error) {
+		return &staticTokenSource{token: &oauth2.Token{AccessToken: "super-secret-token", Expiry: time.Now().Add(time.Hour)}}, nil
+	})
+
+	resp, err := rc.Post(context.Background(), srv.URL, "/tickets", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Post failed: %v", err)
+	}
+	resp.Body.Close()
+
+	logs := logBuf.String()
+	if strings.Contains(logs, "super-secret-token") {
+		t.Fatalf("token leaked into logs: %s", logs)
+	}
+	if !strings.Contains(logs, "Prepared Headers") || !strings.Contains(logs, "REDACTED") {
+		t.Fatalf("expected trace header log with redacted Authorization, got: %s", logs)
+	}
+}
+
+// CreateTicket marks errors retrying can't fix as backoff.Permanent, and
+// leaves transient ones retryable.
+func TestCreateTicket_RetryClassification(t *testing.T) {
+	cases := []struct {
+		name          string
+		status        int
+		body          []byte
+		wantPermanent bool
+	}{
+		{"400 InvalidArgument", http.StatusBadRequest, marshalStatusWithViolations(t, codes.InvalidArgument, "bad ticket", nil), true},
+		{"404 Not Found", http.StatusNotFound, []byte("404 page not found"), true},
+		{"401 Unauthenticated", http.StatusUnauthorized, nil, true},
+		{"429 ResourceExhausted", http.StatusTooManyRequests, marshalStatusWithViolations(t, codes.ResourceExhausted, "slow down", nil), false},
+		{"500 Internal", http.StatusInternalServerError, marshalStatusWithViolations(t, codes.Internal, "oops", nil), false},
+		{"503 Unavailable", http.StatusServiceUnavailable, marshalStatusWithViolations(t, codes.Unavailable, "catching up", nil), false},
+		{"409 Aborted", http.StatusConflict, marshalStatusWithViolations(t, codes.Aborted, "aborted", nil), false},
+		{"501 Unimplemented", http.StatusNotImplemented, marshalStatusWithViolations(t, codes.Unimplemented, "nope", nil), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write(tc.body)
+			}))
+			defer srv.Close()
+
+			rc, _ := newTestClient(t, srv.URL)
+			_, err := rc.CreateTicket(context.Background(), &pb.Ticket{})
+			if err == nil {
+				t.Fatal("expected an error")
 			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{}`))
-		}))
-		defer srv.Close()
-
-		rc, _ := newTestClient(t, srv.URL)
-		rc.Cfg.Set("K_REVISION", "test-rev-403")
-
-		var mintCalls atomic.Int32
-		rc.tokenCache = newOIDCTokenCache(func(ctx context.Context, audience string) (oauth2.TokenSource, error) {
-			n := mintCalls.Add(1)
-			return &staticTokenSource{
-				token: &oauth2.Token{
-					AccessToken: fmt.Sprintf("token-403-%d", n),
-					Expiry:      time.Now().Add(time.Hour),
-				},
-			}, nil
+			var perm *backoff.PermanentError
+			if got := errors.As(err, &perm); got != tc.wantPermanent {
+				t.Fatalf("permanent = %v, want %v (err: %v)", got, tc.wantPermanent, err)
+			}
 		})
+	}
 
-		resp, err := rc.Post(context.Background(), srv.URL, "/tickets:activate", []byte(`{}`))
-		if err != nil {
-			t.Fatalf("Post failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("expected HTTP 200 after 403 refresh retry, got %d", resp.StatusCode)
-		}
-		if got := attempts.Load(); got != 2 {
-			t.Fatalf("expected 2 HTTP attempts, got %d", got)
-		}
-		if got := mintCalls.Load(); got != 2 {
-			t.Fatalf("expected 2 token mints, got %d", got)
+	t.Run("transport error is retryable", func(t *testing.T) {
+		rc, _ := newTestClient(t, "http://127.0.0.1:1")
+		_, err := rc.CreateTicket(context.Background(), &pb.Ticket{})
+		var perm *backoff.PermanentError
+		if err == nil || errors.As(err, &perm) {
+			t.Fatalf("expected retryable transport error, got %v", err)
 		}
 	})
 
-	t.Run("caps retries at one attempt when refreshed token also receives 403", func(t *testing.T) {
-		var attempts atomic.Int32
+	t.Run("per-attempt timeout from OM_CORE_REQUEST_TIMEOUT_MS is retryable", func(t *testing.T) {
+		unblock := make(chan struct{})
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			attempts.Add(1)
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte("still forbidden"))
+			select {
+			case <-r.Context().Done():
+			case <-unblock:
+			}
 		}))
 		defer srv.Close()
+		defer close(unblock)
 
 		rc, _ := newTestClient(t, srv.URL)
-		rc.Cfg.Set("K_REVISION", "test-rev-403-cap")
-
-		var mintCalls atomic.Int32
-		rc.tokenCache = newOIDCTokenCache(func(ctx context.Context, audience string) (oauth2.TokenSource, error) {
-			n := mintCalls.Add(1)
-			return &staticTokenSource{
-				token: &oauth2.Token{
-					AccessToken: fmt.Sprintf("token-cap-%d", n),
-					Expiry:      time.Now().Add(time.Hour),
-				},
-			}, nil
-		})
-
-		resp, err := rc.Post(context.Background(), srv.URL, "/tickets:activate", []byte(`{}`))
-		if err != nil {
-			t.Fatalf("Post returned unexpected transport error: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("expected HTTP 403 when retry also fails, got %d", resp.StatusCode)
-		}
-		if got := attempts.Load(); got != 2 {
-			t.Fatalf("expected retries capped at 1 (2 total HTTP requests), got %d", got)
-		}
-		if got := mintCalls.Load(); got != 2 {
-			t.Fatalf("expected 2 token mints (initial + 1 refresh), got %d", got)
+		rc.Cfg.Set("OM_CORE_REQUEST_TIMEOUT_MS", 50)
+		_, err := rc.CreateTicket(context.Background(), &pb.Ticket{})
+		var perm *backoff.PermanentError
+		if !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &perm) {
+			t.Fatalf("expected retryable context.DeadlineExceeded, got %v", err)
 		}
 	})
+}
+
+// Each /tickets:activate attempt is bounded by OM_CORE_REQUEST_TIMEOUT_MS, so
+// a hung om-core can't hold an activation slot forever.
+func TestActivateTicketsWithResults_PerAttemptTimeout(t *testing.T) {
+	var attempts atomic.Int32
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+	}))
+	defer srv.Close()
+	defer close(unblock)
+
+	rc, _ := newTestClient(t, srv.URL)
+	// 500ms per attempt gives a 1.5s retry budget: long enough that the
+	// first timed-out attempt is always retried (the first backoff interval
+	// is at most 750ms).
+	rc.Cfg.Set("OM_CORE_REQUEST_TIMEOUT_MS", 500)
+
+	inChan := make(chan string, 1)
+	resChan := make(chan ActivationResult, 1)
+	inChan <- "ticket-hang"
+	close(inChan)
+
+	done := make(chan struct{})
+	go func() {
+		rc.ActivateTicketsWithResults(context.Background(), inChan, resChan)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ActivateTicketsWithResults did not give up on a hung om-core")
+	}
+
+	res := <-resChan
+	if !errors.Is(res.Err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded result, got %v", res.Err)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("expected a timed-out attempt to be retried, got %d attempt(s)", got)
+	}
+}
+
+// Client errors with no per-ticket details (404 wrong address, 413, ...) are
+// not retried, and callers get the plain error rather than a
+// *backoff.PermanentError.
+func TestActivateTicketsWithResults_ClientErrorsNotRetried(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusRequestEntityTooLarge, http.StatusBadRequest} {
+		t.Run(fmt.Sprintf("HTTP_%d", status), func(t *testing.T) {
+			var attempts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			rc, _ := newTestClient(t, srv.URL)
+			inChan := make(chan string, 1)
+			resChan := make(chan ActivationResult, 1)
+			inChan <- "ticket-1"
+			close(inChan)
+			rc.ActivateTicketsWithResults(context.Background(), inChan, resChan)
+
+			res := <-resChan
+			if res.Err == nil {
+				t.Fatal("expected an activation error")
+			}
+			var perm *backoff.PermanentError
+			if errors.As(res.Err, &perm) {
+				t.Fatalf("result error should not be a *backoff.PermanentError: %#v", res.Err)
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("expected 1 attempt, got %d", got)
+			}
+		})
+	}
+}
+
+// Concurrent /tickets:activate calls are capped by OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS.
+func TestActivateTicketsWithResults_ConcurrentCallLimit(t *testing.T) {
+	const maxConcurrent = 2
+	const totalTickets = 6
+
+	var inFlight, maxObserved atomic.Int32
+	limitReached := make(chan struct{})
+	var limitOnce sync.Once
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		for {
+			prev := maxObserved.Load()
+			if cur <= prev || maxObserved.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		if cur == maxConcurrent {
+			limitOnce.Do(func() { close(limitReached) })
+		}
+		<-release
+		inFlight.Add(-1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	rc, _ := newTestClient(t, srv.URL)
+	rc.Cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1) // one ticket per call
+	rc.Cfg.Set("OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS", maxConcurrent)
+
+	inChan := make(chan string, totalTickets)
+	resChan := make(chan ActivationResult, totalTickets)
+	for i := range totalTickets {
+		inChan <- fmt.Sprintf("ticket-%d", i)
+	}
+	close(inChan)
+
+	ctx := WithActivationType(context.Background(), "activate")
+	done := make(chan struct{})
+	go func() {
+		rc.ActivateTicketsWithResults(ctx, inChan, resChan)
+		close(done)
+	}()
+
+	select {
+	case <-limitReached:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %d concurrent activation calls", maxConcurrent)
+	}
+	// Give any (incorrectly) uncapped calls a chance to arrive.
+	time.Sleep(100 * time.Millisecond)
+	if got := inFlight.Load(); got != maxConcurrent {
+		t.Fatalf("in-flight activation calls = %d while blocked, want %d", got, maxConcurrent)
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ActivateTicketsWithResults did not finish after releasing calls")
+	}
+
+	if got := maxObserved.Load(); got != maxConcurrent {
+		t.Fatalf("max concurrent activation calls = %d, want %d", got, maxConcurrent)
+	}
+	close(resChan)
+	var succeeded int
+	for res := range resChan {
+		if res.Err != nil {
+			t.Fatalf("unexpected activation error for %s: %v", res.TicketId, res.Err)
+		}
+		succeeded++
+	}
+	if succeeded != totalTickets {
+		t.Fatalf("got %d successful activation results, want %d", succeeded, totalTickets)
+	}
 }

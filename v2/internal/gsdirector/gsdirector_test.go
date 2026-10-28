@@ -21,8 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -40,6 +40,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -103,8 +104,11 @@ func writeStreamedMatchResponse(t *testing.T, w http.ResponseWriter, matches ...
 }
 
 type staticGSManager struct {
-	mu               sync.Mutex
-	requests         []*pb.MmfRequest
+	mu       sync.Mutex
+	requests []*pb.MmfRequest
+	// perCallRequests, if set, is returned by successive GetMMFParams calls
+	// instead of requests (the last entry repeats).
+	perCallRequests  [][]*pb.MmfRequest
 	getCalls         int
 	allocateCalls    int
 	updateCalls      int
@@ -130,6 +134,9 @@ func (s *staticGSManager) GetMMFParams() []*pb.MmfRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.getCalls++
+	if len(s.perCallRequests) > 0 {
+		return slices.Clone(s.perCallRequests[min(s.getCalls, len(s.perCallRequests))-1])
+	}
 	return slices.Clone(s.requests)
 }
 
@@ -202,6 +209,7 @@ func TestRun_MissingMMFRequestHashAndConsecutiveEmptyCyclesExit(t *testing.T) {
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 50)
 	cfg.Set("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 3)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 1)
@@ -601,7 +609,6 @@ func TestMockAgonesIntegration_DynamicRefreshEveryTicketCreationTimeRangeFilter(
 	afterInit := time.Now()
 
 	gotStart := EveryTicket.GetCreationTimeRangeFilter().GetStart().AsTime()
-	gotEnd := EveryTicket.GetCreationTimeRangeFilter().GetEnd().AsTime()
 
 	wantStartMin := beforeInit.Add(-1*time.Hour - 2*time.Second)
 	wantStartMax := afterInit.Add(-1*time.Hour + 2*time.Second)
@@ -609,17 +616,15 @@ func TestMockAgonesIntegration_DynamicRefreshEveryTicketCreationTimeRangeFilter(
 		t.Fatalf("EveryTicket Start = %v, want between %v and %v", gotStart, wantStartMin, wantStartMax)
 	}
 
-	wantEndMin := beforeInit.Add(100*time.Hour - 2*time.Second)
-	wantEndMax := afterInit.Add(100*time.Hour + 2*time.Second)
-	if gotEnd.Before(wantEndMin) || gotEnd.After(wantEndMax) {
-		t.Fatalf("EveryTicket End = %v, want between %v and %v", gotEnd, wantEndMin, wantEndMax)
+	// The range must be open-ended so a long-running director keeps
+	// matching newly created tickets.
+	if end := EveryTicket.GetCreationTimeRangeFilter().GetEnd(); end != nil {
+		t.Fatalf("EveryTicket End = %v, want nil (open-ended range)", end.AsTime())
 	}
 }
 
 // 8. ProposalsLoop Missing vs. Present Backfill Extension
 func TestProposalsLoop_MissingVsPresentBackfillExtension(t *testing.T) {
-	rand.Seed(1)
-
 	agones := &MockAgonesIntegration{Log: newTestLogger()}
 	if err := agones.Init(FleetConfig, ZonePools, GameModesInZone); err != nil {
 		t.Fatalf("agones.Init() failed: %v", err)
@@ -676,6 +681,7 @@ func TestProposalsLoop_MissingVsPresentBackfillExtension(t *testing.T) {
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 1)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 1)
 	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
@@ -738,6 +744,7 @@ func TestRun_InterCycleSleepCancellationAndReactivationFlush(t *testing.T) {
 
 		cfg := viper.New()
 		cfg.Set("OM_CORE_ADDR", srv.URL)
+		cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 		cfg.Set("NUM_MM_CYCLES", 2)
 		cfg.Set("MM_CYCLE_MIN_DURATION_MS", 30000)
 		cfg.Set("ASSIGNMENT_TTL_MS", 60000)
@@ -825,6 +832,7 @@ func TestRun_InterCycleSleepCancellationAndReactivationFlush(t *testing.T) {
 
 		cfg := viper.New()
 		cfg.Set("OM_CORE_ADDR", srv.URL)
+		cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 		cfg.Set("NUM_MM_CYCLES", 1)
 		cfg.Set("MM_CYCLE_MIN_DURATION_MS", 1)
 		cfg.Set("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", true)
@@ -855,8 +863,6 @@ func TestRun_InterCycleSleepCancellationAndReactivationFlush(t *testing.T) {
 
 // 10. Concurrency-Safe Status Summary
 func TestDirector_ConcurrencySafeStatusSummary(t *testing.T) {
-	rand.Seed(1)
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/matches:fetch":
@@ -891,6 +897,7 @@ func TestDirector_ConcurrencySafeStatusSummary(t *testing.T) {
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 3)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 2)
 	cfg.Set("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", true)
@@ -929,7 +936,8 @@ func TestDirector_ConcurrencySafeStatusSummary(t *testing.T) {
 	status := d.Status()
 	expectedSubstrings := []string{
 		"matches accepted",
-		"deactivation_timeout)",
+		"deactivation_timeout, ",
+		"deactivation_failed)",
 		"tickets accepted",
 		"Cycle took ",
 		"minimum cycle duration calculate as ",
@@ -944,8 +952,6 @@ func TestDirector_ConcurrencySafeStatusSummary(t *testing.T) {
 
 // 11. Director Metrics Names, Descriptions, and Recording
 func TestDirector_MetricsNamesDescriptionsAndRecording(t *testing.T) {
-	rand.Seed(1)
-
 	meterPtr, reader := newTestMeter(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -983,6 +989,7 @@ func TestDirector_MetricsNamesDescriptionsAndRecording(t *testing.T) {
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 1)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 5)
 	cfg.Set("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", true)
@@ -999,8 +1006,8 @@ func TestDirector_MetricsNamesDescriptionsAndRecording(t *testing.T) {
 	}
 
 	d.Run(context.Background())
-	// Also record a response failure on otelMMFResponseFailures so it appears in collected metrics.
-	otelMMFResponseFailures.Add(context.Background(), 1)
+	// Also record an invocation failure so it appears in collected metrics.
+	otelMMFInvocationFailures.Add(context.Background(), 1)
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
@@ -1019,11 +1026,11 @@ func TestDirector_MetricsNamesDescriptionsAndRecording(t *testing.T) {
 	}
 
 	wantDescriptions := map[string]string{
-		"gsdirector.mmf.response.failures":                       "Total MMF response stream errors",
-		"gsdirector.ticket.reactivations.failures":               "Total number of ticket re-activations that permanently failed",
+		"gsdirector.mmf.response.failures":                          "Number of InvokeMatchmakingFunctions calls that returned an error (transport or HTTP failure, an MMF failure reported by om-core, or the director-side deadline), by profile.name and grpc.code",
+		"gsdirector.ticket.reactivations.failures":                  "Total number of ticket re-activations that permanently failed",
 		"gsdirector.matchmaking_cycle.match.deactivation_timeouts":  "Number of proposed matches returned by om-core per cycle with the deactivation_timeout extension set",
 		"gsdirector.matchmaking_cycle.ticket.deactivation_timeouts": "Number of tickets in proposed matches returned by om-core per cycle with the deactivation_timeout extension set",
-		"gsdirector.matchmaking_cycle.match.proposals":           "Number of match proposals received from Matchmaking Functions",
+		"gsdirector.matchmaking_cycle.match.proposals":              "Number of match proposals received from Matchmaking Functions",
 	}
 
 	for name, wantDesc := range wantDescriptions {
@@ -1060,8 +1067,6 @@ func TestDirector_MetricsNamesDescriptionsAndRecording(t *testing.T) {
 
 // 12. Backfill Priority, Same-Cycle vs. Cross-Cycle Collision Rejection, and Selective Re-Activation
 func TestRun_BackfillPrioritySameCycleVsCrossCycleCollisionAndSelectiveReactivation(t *testing.T) {
-	rand.Seed(1)
-
 	meterPtr, reader := newTestMeter(t)
 
 	var cycleNum atomic.Int32
@@ -1153,6 +1158,7 @@ func TestRun_BackfillPrioritySameCycleVsCrossCycleCollisionAndSelectiveReactivat
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 2)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 300)
 	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
@@ -1223,8 +1229,6 @@ func TestRun_BackfillPrioritySameCycleVsCrossCycleCollisionAndSelectiveReactivat
 
 // 13. Multi-Ticket Roster Assignment TTL Expiration
 func TestRun_MultiTicketRosterAssignmentTTLExpiration(t *testing.T) {
-	rand.Seed(1)
-
 	var cycleNum atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1289,6 +1293,7 @@ func TestRun_MultiTicketRosterAssignmentTTLExpiration(t *testing.T) {
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 3)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 5)
 	cfg.Set("ASSIGNMENT_TTL_MS", 15)
@@ -1314,8 +1319,6 @@ func TestRun_MultiTicketRosterAssignmentTTLExpiration(t *testing.T) {
 
 // 14. AssignmentPublisher Backoff Context Cancellation
 func TestRun_AssignmentPublisherBackoffContextCancellation(t *testing.T) {
-	rand.Seed(1)
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/matches:fetch":
@@ -1361,6 +1364,7 @@ func TestRun_AssignmentPublisherBackoffContextCancellation(t *testing.T) {
 
 	cfg := viper.New()
 	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
 	cfg.Set("NUM_MM_CYCLES", 1)
 	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 1)
 	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
@@ -1433,4 +1437,672 @@ func TestMockAgonesIntegration_LoggerConfigurationAndNilFallback(t *testing.T) {
 			t.Fatal("expected agones.Log to be initialized when nil")
 		}
 	})
+}
+
+// fakeOMCore is an httptest stand-in for om-core. fetch serves
+// /matches:fetch; the ticket IDs of every /tickets:activate call are recorded.
+type fakeOMCore struct {
+	srv         *httptest.Server
+	mu          sync.Mutex
+	reactivated []string
+}
+
+func newFakeOMCore(t *testing.T, fetch func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest)) *fakeOMCore {
+	t.Helper()
+	f := &fakeOMCore{}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matches:fetch":
+			body, _ := io.ReadAll(r.Body)
+			req := &pb.MmfRequest{}
+			_ = protojson.Unmarshal(body, req)
+			fetch(w, r, req)
+		case "/tickets:activate":
+			body, _ := io.ReadAll(r.Body)
+			var actReq pb.ActivateTicketsRequest
+			_ = protojson.Unmarshal(body, &actReq)
+			f.mu.Lock()
+			f.reactivated = append(f.reactivated, actReq.GetTicketIds()...)
+			f.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+// reactivatedTickets returns the sorted IDs of all re-activated tickets.
+func (f *fakeOMCore) reactivatedTickets() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	got := slices.Clone(f.reactivated)
+	slices.Sort(got)
+	return got
+}
+
+// newTestDirector returns a director wired to f and gsMgr, configured for a
+// single fast cycle with random match rejection disabled. settings override
+// the defaults.
+func newTestDirector(t *testing.T, f *fakeOMCore, gsMgr GameServerManager, log *logrus.Logger, settings map[string]any) (*MockDirector, chan *pb.Roster) {
+	t.Helper()
+	cfg := viper.New()
+	cfg.Set("OM_CORE_ADDR", f.srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
+	cfg.Set("NUM_MM_CYCLES", 1)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 1)
+	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+	for k, v := range settings {
+		cfg.Set(k, v)
+	}
+	if log == nil {
+		log = newTestLogger()
+	}
+	assignChan := make(chan *pb.Roster, 100)
+	return &MockDirector{
+		OmClient:            omclient.New(cfg, log, f.srv.Client()),
+		Cfg:                 cfg,
+		Log:                 log,
+		AssignmentPublisher: assignmentdistributor.NewChannelSender(assignChan),
+		GSManager:           gsMgr,
+	}, assignChan
+}
+
+// staticRequest returns an MmfRequest like the ones a game server manager
+// produces, with the given profile name and request hash.
+func staticRequest(t *testing.T, name, hash string) *pb.MmfRequest {
+	t.Helper()
+	return &pb.MmfRequest{
+		Mmfs: []*pb.MatchmakingFunctionSpec{Fifo},
+		Profile: &pb.Profile{
+			Name: name,
+			Extensions: map[string]*anypb.Any{
+				ex.MMFRequestHashKey:  mustAnyString(t, hash),
+				ex.AgonesAllocatorKey: mustAnyString(t, `{"spec":"`+hash+`"}`),
+			},
+		},
+	}
+}
+
+// testMatch returns a single-roster match made for the request with the given hash.
+func testMatch(t *testing.T, id, hash string, ticketIDs ...string) *pb.Match {
+	t.Helper()
+	tickets := make([]*pb.Ticket, 0, len(ticketIDs))
+	for _, tid := range ticketIDs {
+		tickets = append(tickets, &pb.Ticket{Id: tid})
+	}
+	return &pb.Match{
+		Id:         id,
+		Rosters:    map[string]*pb.Roster{"r1": {Tickets: tickets}},
+		Extensions: map[string]*anypb.Any{ex.MMFRequestHashKey: mustAnyString(t, hash)},
+	}
+}
+
+func collectMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]metricdata.Metrics {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect() error: %v", err)
+	}
+	metricsByName := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricsByName[m.Name] = m
+		}
+	}
+	return metricsByName
+}
+
+func counterTotal(t *testing.T, metricsByName map[string]metricdata.Metrics, name string) int64 {
+	t.Helper()
+	m, ok := metricsByName[name]
+	if !ok {
+		return 0
+	}
+	var total int64
+	for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
+		total += dp.Value
+	}
+	return total
+}
+
+func histogramSum(t *testing.T, metricsByName map[string]metricdata.Metrics, name string) int64 {
+	t.Helper()
+	m, ok := metricsByName[name]
+	if !ok {
+		return 0
+	}
+	var total int64
+	for _, dp := range m.Data.(metricdata.Histogram[int64]).DataPoints {
+		total += dp.Sum
+	}
+	return total
+}
+
+// 16. G1: a ticket in a rejected match and in a later accepted match must
+// not be re-activated.
+func TestRun_TicketInRejectedThenAcceptedMatchIsNotReactivated(t *testing.T) {
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		hash, _ := ex.String(req.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
+		rejected := testMatch(t, "rejected", hash, "t-shared", "t-rejected-only")
+		rejected.Extensions[ex.MatchDeactivationTimeoutKey] = mustAnyBool(t, true)
+		accepted := testMatch(t, "accepted", hash, "t-shared", "t-accepted-only")
+		writeStreamedMatchResponse(t, w, rejected, accepted)
+	})
+	gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.g1.1", "hash-g1")}}
+	d, assignChan := newTestDirector(t, f, gsMgr, nil, map[string]any{
+		"REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT": true,
+	})
+
+	d.Run(context.Background())
+
+	if len(assignChan) != 1 {
+		t.Fatalf("expected 1 assigned roster, got %d", len(assignChan))
+	}
+	if got, want := f.reactivatedTickets(), []string{"t-rejected-only"}; !slices.Equal(got, want) {
+		t.Fatalf("reactivated tickets = %v, want %v (t-shared is in the accepted match)", got, want)
+	}
+}
+
+// 17. G2: cancelling the context while the re-activation channel is full
+// must not hang Run.
+func TestRun_ShutdownWithFullReactivationChannelDoesNotHang(t *testing.T) {
+	// More rejected tickets than the re-activation channel buffers.
+	ticketIDs := make([]string, 1500)
+	for i := range ticketIDs {
+		ticketIDs[i] = fmt.Sprintf("t-%d", i)
+	}
+	activationStarted := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matches:fetch":
+			// No request hash, so the match is rejected.
+			writeStreamedMatchResponse(t, w, &pb.Match{
+				Id: "rejected",
+				Rosters: map[string]*pb.Roster{"r1": {Tickets: func() []*pb.Ticket {
+					tickets := make([]*pb.Ticket, 0, len(ticketIDs))
+					for _, tid := range ticketIDs {
+						tickets = append(tickets, &pb.Ticket{Id: tid})
+					}
+					return tickets
+				}()}},
+			})
+		case "/tickets:activate":
+			// om-core hangs, so re-activations back up.
+			startedOnce.Do(func() { close(activationStarted) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cfg := viper.New()
+	cfg.Set("OM_CORE_ADDR", srv.URL)
+	cfg.Set("RANDOM_MATCH_REJECT_PERCENT", 0)
+	cfg.Set("NUM_MM_CYCLES", 1)
+	cfg.Set("MM_CYCLE_MIN_DURATION_MS", 1)
+	cfg.Set("ASSIGNMENT_TTL_MS", 60000)
+	cfg.Set("OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS", 1)
+	cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	log := newTestLogger()
+	d := &MockDirector{
+		OmClient:            omclient.New(cfg, log, srv.Client()),
+		Cfg:                 cfg,
+		Log:                 log,
+		AssignmentPublisher: assignmentdistributor.NewChannelSender(make(chan *pb.Roster, 10)),
+		GSManager:           &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.g2.1", "hash-g2")}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case <-activationStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first re-activation call")
+	}
+	// Let Run fill the re-activation channel and block on it.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel while the re-activation channel was full")
+	}
+}
+
+// 18. G3: only the current cycle's MmfRequests are valid targets for
+// returned matches.
+func TestRun_PendingMmfRequestsAreRebuiltEachCycle(t *testing.T) {
+	var cycle atomic.Int32
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		// Every match claims to be for the cycle 1 request.
+		c := cycle.Add(1)
+		writeStreamedMatchResponse(t, w, testMatch(t, fmt.Sprintf("m-%d", c), "hash-cycle-1", fmt.Sprintf("c%d-t1", c)))
+	})
+	gsMgr := &staticGSManager{perCallRequests: [][]*pb.MmfRequest{
+		{staticRequest(t, "dev.open-match.g3.1", "hash-cycle-1")},
+		{staticRequest(t, "dev.open-match.g3.2", "hash-cycle-2")},
+	}}
+	d, assignChan := newTestDirector(t, f, gsMgr, nil, map[string]any{"NUM_MM_CYCLES": 2})
+
+	d.Run(context.Background())
+
+	if len(assignChan) != 1 {
+		t.Fatalf("expected only the cycle 1 match to be assigned, got %d rosters", len(assignChan))
+	}
+	if got, want := f.reactivatedTickets(), []string{"c2-t1"}; !slices.Equal(got, want) {
+		t.Fatalf("reactivated tickets = %v, want %v (stale request hash in cycle 2)", got, want)
+	}
+	if got := slices.Sorted(maps.Keys(d.pendingMmfRequestsByHash)); !slices.Equal(got, []string{"hash-cycle-2"}) {
+		t.Fatalf("pending MmfRequest hashes after cycle 2 = %v, want [hash-cycle-2]", got)
+	}
+}
+
+// 19. G5: RANDOM_MATCH_REJECT_PERCENT
+func TestRun_RandomMatchRejectPercent(t *testing.T) {
+	const numMatches = 20
+	for _, tc := range []struct {
+		pct          int
+		wantAssigned int
+	}{
+		{pct: 0, wantAssigned: numMatches},
+		{pct: 100, wantAssigned: 0},
+	} {
+		t.Run(fmt.Sprintf("pct=%d", tc.pct), func(t *testing.T) {
+			f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+				hash, _ := ex.String(req.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
+				var matches []*pb.Match
+				for i := range numMatches {
+					matches = append(matches, testMatch(t, fmt.Sprintf("m-%d", i), hash, fmt.Sprintf("t-%d", i)))
+				}
+				writeStreamedMatchResponse(t, w, matches...)
+			})
+			gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.g5.1", "hash-g5")}}
+			d, assignChan := newTestDirector(t, f, gsMgr, nil, map[string]any{"RANDOM_MATCH_REJECT_PERCENT": tc.pct})
+
+			d.Run(context.Background())
+
+			if len(assignChan) != tc.wantAssigned {
+				t.Fatalf("assigned rosters = %d, want %d", len(assignChan), tc.wantAssigned)
+			}
+			if got, want := len(f.reactivatedTickets()), numMatches-tc.wantAssigned; got != want {
+				t.Fatalf("reactivated tickets = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestMockDirector_RandomMatchRejectPercentConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  bool
+		val  int
+		want int
+	}{
+		{name: "unset uses default", want: defaultRandomMatchRejectPercent},
+		{name: "zero disables", set: true, val: 0, want: 0},
+		{name: "in range", set: true, val: 25, want: 25},
+		{name: "clamped high", set: true, val: 150, want: 100},
+		{name: "clamped low", set: true, val: -5, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := viper.New()
+			if tc.set {
+				cfg.Set("RANDOM_MATCH_REJECT_PERCENT", tc.val)
+			}
+			d := &MockDirector{Cfg: cfg}
+			if got := d.randomMatchRejectPercent(); got != tc.want {
+				t.Fatalf("randomMatchRejectPercent() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// 20. Ticketless MMF responses are feedback, not match proposals; invalid
+// ticket IDs reported by om-core are logged.
+func TestRun_TicketlessResponsesAreFeedbackNotProposals(t *testing.T) {
+	invalidIDs, err := structpb.NewList([]any{"bad-id-1"})
+	if err != nil {
+		t.Fatalf("structpb.NewList: %v", err)
+	}
+	invalidAny, err := anypb.New(invalidIDs)
+	if err != nil {
+		t.Fatalf("anypb.New(ListValue): %v", err)
+	}
+
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		hash, _ := ex.String(req.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
+		ticketless := &pb.Match{
+			Id:         "feedback-match",
+			Extensions: map[string]*anypb.Any{"mmfFeedbackKey": mustAnyString(t, "no tickets in pool")},
+		}
+		real := testMatch(t, "real-match", hash, "t-real")
+		// Some tickets invalid: rejected, only the valid ticket re-activated.
+		partial := testMatch(t, "partially-invalid-match", hash, "t-partial-valid", "bad-id-1")
+		partial.Extensions[invalidTicketIdsExtensionKey] = invalidAny
+		// Every ticket invalid: feedback, not a proposal.
+		allInvalid := testMatch(t, "all-invalid-match", hash, "bad-id-1")
+		allInvalid.Extensions[invalidTicketIdsExtensionKey] = invalidAny
+		writeStreamedMatchResponse(t, w, ticketless, real, partial, allInvalid)
+		// A response with no match at all.
+		_, _ = w.Write([]byte(`{"result":{}}` + "\n"))
+	})
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	log := logrus.New()
+	log.SetOutput(&lockedWriter{mu: &logMu, w: &logBuf})
+	log.SetLevel(logrus.DebugLevel)
+
+	meterPtr, reader := newTestMeter(t)
+	gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.feedback.1", "hash-feedback")}}
+	d, assignChan := newTestDirector(t, f, gsMgr, log, nil)
+	d.OtelMeterPtr = meterPtr
+
+	d.Run(context.Background())
+
+	if len(assignChan) != 1 {
+		t.Fatalf("expected only the real match to be assigned, got %d rosters", len(assignChan))
+	}
+	if gsMgr.allocateCalls != 1 {
+		t.Fatalf("Allocate calls = %d, want 1", gsMgr.allocateCalls)
+	}
+	if got, want := f.reactivatedTickets(), []string{"t-partial-valid"}; !slices.Equal(got, want) {
+		t.Fatalf("reactivated tickets = %v, want %v (invalid IDs must never be re-activated)", got, want)
+	}
+
+	metricsByName := collectMetrics(t, reader)
+	if got := counterTotal(t, metricsByName, "gsdirector.mmf.feedback_responses"); got != 3 {
+		t.Fatalf("gsdirector.mmf.feedback_responses = %d, want 3", got)
+	}
+	if got := histogramSum(t, metricsByName, "gsdirector.matchmaking_cycle.match.proposals"); got != 2 {
+		t.Fatalf("gsdirector.matchmaking_cycle.match.proposals = %d, want 2", got)
+	}
+	if got := histogramSum(t, metricsByName, "gsdirector.matchmaking_cycle.match.rejections"); got != 1 {
+		t.Fatalf("gsdirector.matchmaking_cycle.match.rejections = %d, want 1", got)
+	}
+	for _, dp := range metricsByName["gsdirector.mmf.feedback_responses"].Data.(metricdata.Sum[int64]).DataPoints {
+		if v, _ := dp.Attributes.Value("profile.name"); v.AsString() != "dev.open-match.feedback" {
+			t.Fatalf("feedback metric profile.name = %q, want the bounded profile name", v.AsString())
+		}
+	}
+
+	logMu.Lock()
+	logs := logBuf.String()
+	logMu.Unlock()
+	for _, want := range []string{"MMF feedback", "mmfFeedbackKey", "did not deactivate them", "bad-id-1"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("logs missing %q:\n%s", want, logs)
+		}
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// 20b. A match in which om-core reports failed ticket deactivations is
+// rejected (its tickets may still be active and matched elsewhere), its
+// tickets are re-activated, and the rejection is logged at INFO.
+func TestRun_MatchWithFailedDeactivationsIsRejected(t *testing.T) {
+	failedIDs, err := structpb.NewList([]any{"t-deact-failed"})
+	if err != nil {
+		t.Fatalf("structpb.NewList: %v", err)
+	}
+	failedAny, err := anypb.New(failedIDs)
+	if err != nil {
+		t.Fatalf("anypb.New(ListValue): %v", err)
+	}
+
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		hash, _ := ex.String(req.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
+		failed := testMatch(t, "deactivation-failed-match", hash, "t-deact-ok", "t-deact-failed")
+		failed.Extensions[deactivationFailedTicketIdsExtensionKey] = failedAny
+		ok := testMatch(t, "ok-match", hash, "t-ok")
+		writeStreamedMatchResponse(t, w, failed, ok)
+	})
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	log := logrus.New()
+	log.SetOutput(&lockedWriter{mu: &logMu, w: &logBuf})
+	log.SetLevel(logrus.InfoLevel)
+
+	gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.deactfail.1", "hash-deactfail")}}
+	d, assignChan := newTestDirector(t, f, gsMgr, log, nil)
+
+	d.Run(context.Background())
+
+	if len(assignChan) != 1 {
+		t.Fatalf("expected only ok-match to be assigned, got %d rosters", len(assignChan))
+	}
+	if roster := <-assignChan; len(roster.GetTickets()) != 1 || roster.GetTickets()[0].GetId() != "t-ok" {
+		t.Fatalf("assigned roster = %v, want only t-ok", roster.GetTickets())
+	}
+	// Both tickets of the rejected match go back to the pool; re-activating
+	// the one whose deactivation failed is harmless.
+	if got, want := f.reactivatedTickets(), []string{"t-deact-failed", "t-deact-ok"}; !slices.Equal(got, want) {
+		t.Fatalf("reactivated tickets = %v, want %v", got, want)
+	}
+	if status := d.Status(); !strings.Contains(status, "00001 deactivation_failed") {
+		t.Fatalf("status missing deactivation_failed count:\n%s", status)
+	}
+
+	logMu.Lock()
+	logs := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logs, "level=info") || !strings.Contains(logs, "could not deactivate 1 of its tickets") || !strings.Contains(logs, "t-deact-failed") {
+		t.Fatalf("expected an INFO log naming the ticket om-core could not deactivate, got:\n%s", logs)
+	}
+}
+
+// 21. A failed InvokeMatchmakingFunctions call is recorded, its matches are
+// still processed, and the cycle isn't counted as empty.
+func TestRun_InvokeMatchmakingFunctionsErrorIsRecorded(t *testing.T) {
+	const mmfFailure = `{"error":{"code":13,"message":"1 of 1 matchmaking functions failed: FIFO: boom",` +
+		`"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MMF_FAILURE","domain":"open-match",` +
+		`"metadata":{"mmf_name":"FIFO","grpc_code":"Unavailable","message":"boom"}}]}}`
+
+	var cycle atomic.Int32
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		hash, _ := ex.String(req.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
+		if cycle.Add(1) == 1 {
+			writeStreamedMatchResponse(t, w, testMatch(t, "before-error", hash, "t-1"))
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+		}
+		_, _ = w.Write([]byte(mmfFailure + "\n"))
+	})
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	log := logrus.New()
+	log.SetOutput(&lockedWriter{mu: &logMu, w: &logBuf})
+
+	meterPtr, reader := newTestMeter(t)
+	gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.err.1", "hash-err")}}
+	d, assignChan := newTestDirector(t, f, gsMgr, log, map[string]any{
+		"NUM_MM_CYCLES": 3,
+		// Failed cycles must not count as empty, so all 3 cycles run.
+		"NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT": 1,
+	})
+	d.OtelMeterPtr = meterPtr
+
+	d.Run(context.Background())
+
+	if len(assignChan) != 1 {
+		t.Fatalf("expected the match streamed before the error to be assigned, got %d rosters", len(assignChan))
+	}
+	if gsMgr.getCalls != 3 {
+		t.Fatalf("cycles run = %d, want 3 (failed cycles must not count as empty)", gsMgr.getCalls)
+	}
+
+	metricsByName := collectMetrics(t, reader)
+	if got := counterTotal(t, metricsByName, "gsdirector.mmf.response.failures"); got != 3 {
+		t.Fatalf("gsdirector.mmf.response.failures = %d, want 3", got)
+	}
+	for _, dp := range metricsByName["gsdirector.mmf.response.failures"].Data.(metricdata.Sum[int64]).DataPoints {
+		if v, _ := dp.Attributes.Value("grpc.code"); v.AsString() != "Internal" {
+			t.Fatalf("failure metric grpc.code = %q, want Internal", v.AsString())
+		}
+	}
+
+	logMu.Lock()
+	logs := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logs, "failed_mmfs=\"[FIFO]\"") && !strings.Contains(logs, "failed_mmfs=[FIFO]") {
+		t.Fatalf("logs missing failed MMF name:\n%s", logs)
+	}
+
+	t.Run("empty cycles without failures still end the run", func(t *testing.T) {
+		f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+		})
+		gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.err.1", "hash-err")}}
+		d, _ := newTestDirector(t, f, gsMgr, nil, map[string]any{
+			"NUM_MM_CYCLES": 3,
+			"NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT": 1,
+		})
+		d.Run(context.Background())
+		if gsMgr.getCalls != 1 {
+			t.Fatalf("cycles run = %d, want 1", gsMgr.getCalls)
+		}
+	})
+}
+
+// 22. G6: the director-side deadline ends a cycle whose
+// InvokeMatchmakingFunctions call never returns.
+func TestRun_MMFInvocationTimeout(t *testing.T) {
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		<-r.Context().Done()
+	})
+	meterPtr, reader := newTestMeter(t)
+	gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.timeout.1", "hash-timeout")}}
+	d, _ := newTestDirector(t, f, gsMgr, nil, map[string]any{"MMF_INVOCATION_TIMEOUT_SECS": 1})
+	d.OtelMeterPtr = meterPtr
+
+	start := time.Now()
+	d.Run(context.Background())
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Run took %v, want about 1s (MMF_INVOCATION_TIMEOUT_SECS)", elapsed)
+	}
+
+	metricsByName := collectMetrics(t, reader)
+	if got := counterTotal(t, metricsByName, "gsdirector.mmf.response.failures"); got != 1 {
+		t.Fatalf("gsdirector.mmf.response.failures = %d, want 1", got)
+	}
+	for _, dp := range metricsByName["gsdirector.mmf.response.failures"].Data.(metricdata.Sum[int64]).DataPoints {
+		if v, _ := dp.Attributes.Value("grpc.code"); v.AsString() != "DeadlineExceeded" {
+			t.Fatalf("failure metric grpc.code = %q, want DeadlineExceeded", v.AsString())
+		}
+	}
+}
+
+// 22b. G6: the director-side deadline firing mid-stream (after om-core has
+// started streaming) is recorded as a failure; matches already received are
+// processed, and failed cycles aren't counted as empty.
+func TestRun_MMFInvocationTimeoutMidStream(t *testing.T) {
+	var cycle atomic.Int32
+	f := newFakeOMCore(t, func(w http.ResponseWriter, r *http.Request, req *pb.MmfRequest) {
+		hash, _ := ex.String(req.GetProfile().GetExtensions(), ex.MMFRequestHashKey)
+		if cycle.Add(1) == 1 {
+			writeStreamedMatchResponse(t, w, testMatch(t, "before-stall", hash, "t-1"))
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+		}
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	meterPtr, reader := newTestMeter(t)
+	gsMgr := &staticGSManager{requests: []*pb.MmfRequest{staticRequest(t, "dev.open-match.midstream.1", "hash-midstream")}}
+	d, assignChan := newTestDirector(t, f, gsMgr, nil, map[string]any{
+		"MMF_INVOCATION_TIMEOUT_SECS":                 1,
+		"NUM_MM_CYCLES":                               3,
+		"NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT": 1,
+	})
+	d.OtelMeterPtr = meterPtr
+
+	d.Run(context.Background())
+
+	if len(assignChan) != 1 {
+		t.Fatalf("expected the match streamed before the stall to be assigned, got %d rosters", len(assignChan))
+	}
+	if gsMgr.getCalls != 3 {
+		t.Fatalf("cycles run = %d, want 3 (timed-out cycles must not count as empty)", gsMgr.getCalls)
+	}
+	metricsByName := collectMetrics(t, reader)
+	if got := counterTotal(t, metricsByName, "gsdirector.mmf.response.failures"); got != 3 {
+		t.Fatalf("gsdirector.mmf.response.failures = %d, want 3", got)
+	}
+	for _, dp := range metricsByName["gsdirector.mmf.response.failures"].Data.(metricdata.Sum[int64]).DataPoints {
+		if v, _ := dp.Attributes.Value("grpc.code"); v.AsString() != "DeadlineExceeded" {
+			t.Fatalf("failure metric grpc.code = %q, want DeadlineExceeded", v.AsString())
+		}
+	}
+}
+
+// 23. F14: Run refuses to start without its required dependencies.
+func TestRun_MissingRequiredFields(t *testing.T) {
+	var logBuf bytes.Buffer
+	log := logrus.New()
+	log.SetOutput(&logBuf)
+	d := &MockDirector{Log: log, Cfg: viper.New()}
+
+	done := make(chan struct{})
+	go func() {
+		d.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return with missing required fields")
+	}
+	for _, want := range []string{"OmClient", "GSManager", "AssignmentPublisher"} {
+		if !strings.Contains(logBuf.String(), want) {
+			t.Fatalf("error log missing %q: %s", want, logBuf.String())
+		}
+	}
+}
+
+func TestMetricProfileName(t *testing.T) {
+	for in, want := range map[string]string{
+		"dev.open-match.APAC/JP_Tokyo@asia-northeast1-a.SoloDuel.1700000000": "dev.open-match.APAC/JP_Tokyo@asia-northeast1-a.SoloDuel",
+		"backfill.dev.open-match.APAC.SoloDuel.abc123":                       "backfill.dev.open-match.APAC.SoloDuel",
+		"nodots": "nodots",
+		"":       "",
+	} {
+		if got := metricProfileName(in); got != want {
+			t.Fatalf("metricProfileName(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
