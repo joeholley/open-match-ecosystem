@@ -45,7 +45,7 @@ All configuration is read via Viper from environment variables:
 | `DEBUGMMF_PORT` | `50081` | Port of the `debug` MMF gRPC server (`443` on Cloud Run). |
 | `NUM_MM_CYCLES` | `2147483647` (`math.MaxInt32`) | Maximum number of matchmaking cycles `gsdirector` will run before stopping and exiting the process. |
 | `MM_CYCLE_MIN_DURATION_MS` | `5000` | Base minimum duration of a matchmaking cycle in milliseconds, scaled up by adaptive backoff on cross-cycle collisions or deactivation timeouts. |
-| `MMF_INVOCATION_TIMEOUT_SECS` | `600` | Director-side deadline in seconds for each cycle's `InvokeMatchmakingFunctions` calls (default matches `om-core`'s `OM_MMF_TIMEOUT_SECS`; `0` means no director-side deadline). |
+| `MMF_INVOCATION_TIMEOUT_SECS` | `700` | Director-side deadline in seconds for each cycle's `InvokeMatchmakingFunctions` calls (`0` means no director-side deadline). Keep it above `om-core`'s `OM_MMF_TIMEOUT_SECS` (600) plus `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` (60000 ms = 60 s), since `om-core` can keep streaming matches and its end-of-stream `MMF_FAILURE` status for up to the deactivation timeout after the MMF deadline. |
 | `NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT` | `2147483647` (`math.MaxInt32`) | Stops the director (and exits the process) if this many consecutive cycles produce zero match proposals. |
 | `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT` | `false` | When `true`, rejects any proposed match with `deactivation_timeout=true` in `Match.Extensions` and re-activates its unclaimed tickets. |
 | `WAIT_FOR_BACKFILL_MMFS` | `false` | When `true`, invokes `MmfRequest`s whose profile name starts with `"backfill."` synchronously before launching standard concurrent MMF requests. |

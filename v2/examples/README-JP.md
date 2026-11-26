@@ -133,10 +133,11 @@ Open Match 2は複数のMMFやプロファイルを並行して実行でき、�
 **対処手順 (Remediation Steps)**:
 
 1. **パックされた状態更新 (`OM_CACHE_PACK_TICKET_STATE_UPDATES`) によるRedisレプリケーション負荷の削減**:
-   * `om-core` で `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` を有効にすると、複数のチケット有効化・非有効化更新が少数のRedisストリームエントリ（`om_core.cache.outgoing.updates`）にパックされ、高スループット時のRedis書き込み・読み取り負荷とレプリケーション遅延が大幅に削減されます。
-   * **安全なロールアウト順序**: 古いバージョンの `om-core` インスタンスは、パックされた複数チケットのストリームエントリを解析できません。必ず以下の2段階でロールアウトしてください。
-     1. まず、`OM_CACHE_PACK_TICKET_STATE_UPDATES=false` の状態で、パック形式の読み取りに対応した新しい `om-core` バイナリをすべてのインスタンスにデプロイします（またはメンテナンスウィンドウ中にRedisをフラッシュして古いインスタンスがストリームを読まないようにします）。
-     2. 稼働中のすべての `om-core` インスタンスがアンパックに対応した後に、`OM_CACHE_PACK_TICKET_STATE_UPDATES=true` に更新します。
+   * `om-core` で `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` を有効にすると、複数のチケット有効化・非有効化更新が `om-replication` Redis Stream 内の少数のエントリにパックされ（`om_core.cache.outgoing.updates` で確認できます）、高スループット時のRedis書き込み・読み取り負荷とレプリケーション遅延が大幅に削減されます。
+   * **ロールアウトのルール（スタック全体でのみ変更、ライブ変更は不可）**: `om-core` `v2.0.x` はパックされたエントリの最初のチケットIDのみを読み取り、残りを無言で破棄します（マッチ済みのプレイヤーがアクティブのまま残り、再有効化されたプレイヤーが非アクティブのまま取り残されます）。この設定のライブ（ローリング）変更はどちらの方向にもサポートされていないため、1つのRedisインスタンス上で異なる設定や、パッキングを有効にしたインスタンスと `v2.0.x` を混在させないでください。マッチメーカーのデプロイメントはスタック全体（Redis、`om-core`、MMF、マッチメイキングキュー、ディレクター）であり、設定は以下のいずれかの方法でのみ変更してください。
+     1. **スタック全体のブルーグリーンデプロイ（推奨）**: 新しいRedisインスタンスを含む独立した新しいスタックを目的の設定で構築し、新しいマッチメイキングリクエストをそちらにルーティングします。旧スタックは自然に排出させ（残りのチケットは `OM_CACHE_TICKET_TTL_MS` 以内にマッチするか期限切れになります）、その後Redisを含む旧スタック全体を廃止します。ロールバックも同じ手順で行います。
+     2. **メンテナンスウィンドウ**: マッチメーカーを排出し、すべての `om-core` インスタンスを停止し、Redisを新しいインスタンスに置き換えてから、新しい設定で `om-core` を起動します。
+     * 詳細は `open-match2` のドキュメント [パッキングされたチケット状態更新の有効化と無効化](https://github.com/googleforgames/open-match2/blob/main/docs/jp/ADVANCED.md#パッキングされたチケット状態更新の有効化と無効化) を参照してください。
 2. **非有効化待機時間とサイクル間隔の調整**:
    * `om-core` で `OM_MATCH_TICKET_DEACTIVATION_WAIT=true` を維持し、`OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` がピーク時の `om_core.cache.replication.lag` より大きくなるよう設定します。
    * `gsdirector` の `MM_CYCLE_MIN_DURATION_MS` を `om_core.cache.replication.lag` のp95/p99（および `OM_CACHE_IN_WAIT_TIMEOUT_MS`）より大きく設定し、遅延スパイク時に未確認マッチの通過よりも衝突防止を優先したい場合は `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=true` を有効にします。

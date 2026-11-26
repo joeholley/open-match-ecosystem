@@ -1,6 +1,6 @@
 module open-match.dev/open-match-ecosystem/v2
 
-go 1.26.9
+go 1.27.4
 
 require (
 	agones.dev/agones v1.61.0

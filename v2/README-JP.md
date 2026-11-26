@@ -12,7 +12,7 @@ This doc in English: [Open Match v2.x Ecosystem](README.md)
 
 ### メンテナー向け (For Maintainers)
 
-このモジュール（`open-match.dev/open-match-ecosystem/v2`）は **Go 1.26以降** を対象としています。`v2/` ディレクトリで依存関係をメンテナンスする際は、以下の手順に従ってください。
+このモジュール（`open-match.dev/open-match-ecosystem/v2`）は **Go 1.27.4以降**（`open-match2` と同じ最小バージョン）を対象としています。`v2/` ディレクトリで依存関係をメンテナンスする際は、以下の手順に従ってください。
 
 1. **Open Match Core (`om-core`) のprotobufおよびクライアントライブラリの更新**:
    ```bash

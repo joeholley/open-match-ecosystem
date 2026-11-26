@@ -151,7 +151,7 @@ steps:
       # - --update-env-vars
       # - "MM_CYCLE_MIN_DURATION_MS=5000"
       # - --update-env-vars
-      # - "MMF_INVOCATION_TIMEOUT_SECS=600"
+      # - "MMF_INVOCATION_TIMEOUT_SECS=700"
       # - --update-env-vars
       # - "OM_CORE_REQUEST_TIMEOUT_MS=5000"
       # Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL:

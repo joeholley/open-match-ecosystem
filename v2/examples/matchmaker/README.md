@@ -168,7 +168,7 @@ All configuration is read via Viper from environment variables:
 | `MMQUEUE_TICKET_TTL_MS` | `600000` | How long (in milliseconds) the queue tracks a ticket before treating it as expired; keep it equal to `om-core`'s `OM_CACHE_TICKET_TTL_MS`. |
 | `NUM_MM_CYCLES` | `2147483647` (`math.MaxInt32`) | Maximum number of matchmaking cycles `gsdirector` will run before stopping; the whole process shuts down when the director stops. |
 | `MM_CYCLE_MIN_DURATION_MS` | `5000` | Base minimum duration of a matchmaking cycle in milliseconds before adaptive backoff scaling. |
-| `MMF_INVOCATION_TIMEOUT_SECS` | `600` | Director-side deadline in seconds for each cycle's `InvokeMatchmakingFunctions` calls (the default matches `om-core`'s `OM_MMF_TIMEOUT_SECS`; `0` means none). |
+| `MMF_INVOCATION_TIMEOUT_SECS` | `700` | Director-side deadline in seconds for each cycle's `InvokeMatchmakingFunctions` calls (`0` means none). Keep it above `om-core`'s `OM_MMF_TIMEOUT_SECS` (600) plus `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` (60000 ms = 60 s), since `om-core` can keep streaming matches and its end-of-stream `MMF_FAILURE` status for up to the deactivation timeout after the MMF deadline. |
 | `NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT` | `2147483647` (`math.MaxInt32`) | Stops the director—and so shuts down the process—if this many consecutive cycles return zero proposed matches. |
 | `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT` | `false` | When `true`, rejects any proposed match with `deactivation_timeout=true` in `Match.Extensions` and re-activates its unclaimed tickets. |
 | `WAIT_FOR_BACKFILL_MMFS` | `false` | When `true`, invokes `MmfRequest`s whose profile name starts with `"backfill."` synchronously before launching standard concurrent MMF requests. |

@@ -132,10 +132,11 @@ Because Open Match 2 can run multiple MMFs and profiles in parallel—and becaus
 **Remediation Steps**:
 
 1. **Reduce Redis Replication Overhead with Packed Updates (`OM_CACHE_PACK_TICKET_STATE_UPDATES`)**:
-   * Enable `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` on `om-core` so multiple ticket activation/deactivation updates are packed into fewer Redis stream entries (`om_core.cache.outgoing.updates`), significantly lowering Redis write/read overhead and replication lag at high ticket rates.
-   * **Safe Rollout Order**: Older `om-core` instances cannot parse packed multi-ticket stream entries. Always roll out in two steps:
-     1. First, deploy the updated `om-core` binary across all instances with `OM_CACHE_PACK_TICKET_STATE_UPDATES=false` (or flush Redis during a maintenance window so no legacy instance reads the stream).
-     2. Once 100% of running `om-core` instances support unpacking, update `om-core` to set `OM_CACHE_PACK_TICKET_STATE_UPDATES=true`.
+   * Enable `OM_CACHE_PACK_TICKET_STATE_UPDATES=true` on `om-core` so multiple ticket activation/deactivation updates are packed into fewer entries in the `om-replication` Redis Stream (observable via `om_core.cache.outgoing.updates`), significantly lowering Redis write/read overhead and replication lag at high ticket rates.
+   * **Rollout Rule (whole-stack only, never live)**: `om-core` `v2.0.x` reads only the first ticket ID of a packed entry and silently drops the rest (leaving matched players active and re-activated players stuck inactive). Live or rolling changes of this setting are not supported in either direction, so never mix settings, or packing-enabled instances with `v2.0.x`, on one Redis instance. A matchmaker deployment is the whole stack (Redis, `om-core`, MMFs, matchmaking queue, and director); change the setting only with one of:
+     1. **Blue-green whole-stack deployment (recommended)**: stand up a new, independent stack, including a new Redis instance, with the target setting; route new matchmaking requests to it; let the old stack drain (its remaining tickets are matched or expire within `OM_CACHE_TICKET_TTL_MS`); then decommission the old stack, including its Redis. Roll back the same way.
+     2. **Maintenance window**: drain the matchmaker, stop every `om-core` instance, replace Redis with a fresh instance, then start `om-core` with the new setting.
+     * See [Enabling or Disabling Packed Ticket State Updates](https://github.com/googleforgames/open-match2/blob/main/docs/ADVANCED.md#enabling-or-disabling-packed-ticket-state-updates) in the `open-match2` docs for details.
 2. **Tune Deactivation Wait & Cycle Cadence**:
    * Keep `OM_MATCH_TICKET_DEACTIVATION_WAIT=true` on `om-core` and ensure `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` is larger than peak `om_core.cache.replication.lag`.
    * Set `MM_CYCLE_MIN_DURATION_MS` on `gsdirector` higher than your p95/p99 `om_core.cache.replication.lag` (and `OM_CACHE_IN_WAIT_TIMEOUT_MS`), and enable `REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=true` if you prefer to reject unconfirmed matches rather than risk cross-instance staleness during lag spikes.

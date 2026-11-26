@@ -140,7 +140,7 @@ steps:
       # - --update-env-vars
       # - "MM_CYCLE_MIN_DURATION_MS=5000"
       # - --update-env-vars
-      # - "MMF_INVOCATION_TIMEOUT_SECS=600"
+      # - "MMF_INVOCATION_TIMEOUT_SECS=700"
       # - --update-env-vars
       # - "NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=2147483647"
       # - --update-env-vars

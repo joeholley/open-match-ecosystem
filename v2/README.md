@@ -12,7 +12,7 @@ This is the subdirectory holding the examples and development framework for buil
 
 ### For Maintainers
 
-This module (`open-match.dev/open-match-ecosystem/v2`) targets **Go 1.26+**. When maintaining dependencies from the `v2/` directory:
+This module (`open-match.dev/open-match-ecosystem/v2`) targets **Go 1.27.4+** (the same minimum as `open-match2`). When maintaining dependencies from the `v2/` directory:
 
 1. **Upgrade Open Match Core (`om-core`) protobufs and client libraries**:
    ```bash

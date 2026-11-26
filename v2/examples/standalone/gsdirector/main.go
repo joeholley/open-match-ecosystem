@@ -105,9 +105,16 @@ func run() int {
 	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32) // math.MaxInt32 cycles is essentially forever
 	cfg.SetDefault("MM_CYCLE_MIN_DURATION_MS", 5000)
 	// Director-side deadline for each cycle's InvokeMatchmakingFunctions calls;
-	// the default matches om-core's OM_MMF_TIMEOUT_SECS default; 0 means no
-	// director-side deadline.
-	cfg.SetDefault("MMF_INVOCATION_TIMEOUT_SECS", 600)
+	// 0 means no director-side deadline. The default (700s) must exceed
+	// om-core's OM_MMF_TIMEOUT_SECS (600s) plus
+	// OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS (60s): with
+	// OM_MATCH_TICKET_DEACTIVATION_WAIT=true, om-core can keep streaming matches
+	// for up to the deactivation timeout after the MMF deadline, and ends the
+	// stream with its MMF_FAILURE status. A director deadline at or below that
+	// sum would drop those trailing matches (leaving their tickets inactive
+	// until TTL) and the failure details. Raise it if you raise either om-core
+	// setting.
+	cfg.SetDefault("MMF_INVOCATION_TIMEOUT_SECS", 700)
 	// Exit if this many consecutive matchmaking cycles come back empty. Again,
 	// you probably don't want to do this in production, but it can be very useful
 	// in local testing. The default (math.MaxInt32) never exits.
