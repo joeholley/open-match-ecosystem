@@ -80,6 +80,7 @@ gcloud builds submit --async --no-source \
 
 Key Cloud Run deployment requirements:
 
+* **Private Google Access**: `om-core` v2.1.0 deploys with `--ingress internal`, and this service reaches its `*.run.app` URL (and Google APIs such as Pub/Sub) through Direct VPC egress (`--network=default --subnet=default --vpc-egress=all-traffic`). That only works if the `default` subnet has Private Google Access enabled and this service runs in the same project / VPC Service Controls perimeter as `om-core`: `gcloud compute networks subnets update default --region=${REGION} --enable-private-ip-google-access`.
 * **Exact `https://` `OM_CORE_ADDR` and IAM**: `_OM_CORE_ADDR` must be the exact `https://` service URL of `om-core`. When `K_REVISION` is set (which Cloud Run sets automatically), `omclient` authenticates every `om-core` call with a Google-signed ID token for that exact URL audience, and `gsdirector`'s service account needs `roles/run.invoker` on `om-core`.
 * **HTTPS MMF URLs and `om-core` IAM**: `_SOLODUEL_ADDR` must include `https://` with `_SOLODUEL_PORT=443` (and likewise for `_DEBUGMMF_ADDR` / `_DEBUGMMF_PORT` if enabled), and `om-core`'s service account needs `roles/run.invoker` on the MMF Cloud Run service(s).
 * **Pub/Sub permissions**: `gsdirector`'s service account needs `roles/pubsub.publisher` on the existing `ASSIGNMENT_TOPIC_ID` topic.

@@ -1596,3 +1596,70 @@ func TestActivateTicketsWithResults_ConcurrentCallLimit(t *testing.T) {
 		t.Fatalf("expected 6 successful activation results, got %d", count)
 	}
 }
+
+// TestStatusErrorFromJSON verifies that statusErrorFromJSON decodes both the
+// bare google.rpc.Status JSON written by grpc-gateway for unary errors and the
+// {"error": <Status>} envelope written for streaming RPCs (such as
+// InvokeMatchmakingFunctions), preserving the gRPC code and error details, and
+// falls back to codes.Unknown with the raw body for undecodable input.
+func TestStatusErrorFromJSON(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantCode    codes.Code
+		wantMsg     string
+		wantDetails int
+	}{
+		{
+			name:     "bare status",
+			body:     `{"code":3,"message":"bad request"}`,
+			wantCode: codes.InvalidArgument,
+			wantMsg:  "bad request",
+		},
+		{
+			name:     "error envelope",
+			body:     `{"error":{"code":14,"message":"cache not caught up"}}`,
+			wantCode: codes.Unavailable,
+			wantMsg:  "cache not caught up",
+		},
+		{
+			name:        "error envelope with ErrorInfo details",
+			body:        `{"error":{"code":13,"message":"1 of 1 matchmaking functions failed","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MMF_FAILURE","domain":"open-match","metadata":{"mmf_name":"fifo"}}]}}`,
+			wantCode:    codes.Internal,
+			wantMsg:     "1 of 1 matchmaking functions failed",
+			wantDetails: 1,
+		},
+		{
+			name:     "undecodable body",
+			body:     `not json`,
+			wantCode: codes.Unknown,
+			wantMsg:  "not json",
+		},
+		{
+			name:     "empty body uses fallback message",
+			body:     ``,
+			wantCode: codes.Unknown,
+			wantMsg:  "fallback",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := status.Convert(statusErrorFromJSON([]byte(tc.body), "fallback"))
+			if st.Code() != tc.wantCode {
+				t.Errorf("code = %v, want %v", st.Code(), tc.wantCode)
+			}
+			if st.Message() != tc.wantMsg {
+				t.Errorf("message = %q, want %q", st.Message(), tc.wantMsg)
+			}
+			if got := len(st.Details()); got != tc.wantDetails {
+				t.Fatalf("len(details) = %d, want %d", got, tc.wantDetails)
+			}
+			if tc.wantDetails > 0 {
+				info, ok := st.Details()[0].(*errdetails.ErrorInfo)
+				if !ok || info.GetReason() != "MMF_FAILURE" || info.GetMetadata()["mmf_name"] != "fifo" {
+					t.Errorf("details[0] = %v, want ErrorInfo{MMF_FAILURE, mmf_name=fifo}", st.Details()[0])
+				}
+			}
+		})
+	}
+}

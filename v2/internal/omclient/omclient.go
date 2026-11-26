@@ -258,8 +258,20 @@ func isRetryableStatus(httpStatus int, body []byte) bool {
 // statusErrorFromJSON decodes a google.rpc.Status (as written by grpc-gateway)
 // into a gRPC status error, preserving any error details, and falls back to
 // codes.Unknown with the raw body as the message if it cannot be decoded.
+//
+// grpc-gateway writes the Status either bare (unary error responses) or wrapped
+// in an {"error": <Status>} envelope (streaming RPCs such as
+// InvokeMatchmakingFunctions, both for non-200 responses that fail before any
+// message is streamed and for the final line of a stream that ends in error),
+// so a top-level "error" object is unwrapped before decoding.
 func statusErrorFromJSON(body []byte, fallbackMsg string) error {
 	trimmed := bytes.TrimSpace(body)
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err == nil && len(envelope.Error) > 0 && envelope.Error[0] == '{' {
+		trimmed = bytes.TrimSpace(envelope.Error)
+	}
 	if len(trimmed) > 0 {
 		var rpcStatus spb.Status
 		unmarshalOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
@@ -435,6 +447,7 @@ func deduplicateTicketIDs(ids []string) []string {
 }
 
 // ActivateTickets delegates to ActivateTicketsWithResults with a nil results channel.
+// See ActivateTicketsWithResults for how om-core treats unknown ticket IDs.
 func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToActivate <-chan string) {
 	rc.ActivateTicketsWithResults(ctx, ticketIdsToActivate, nil)
 }
@@ -444,6 +457,14 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 // /tickets:activate with per-ticket status parsing and subset retries, and
 // reports per-ticket outcomes to resultsChan when non-nil. At most
 // OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS batches are in flight at once.
+//
+// om-core rejects only malformed ticket IDs (InvalidArgument). Activating a
+// well-formed ID that om-core no longer knows (for example, a ticket that has
+// expired after OM_CACHE_TICKET_TTL_MS or been evicted) is a silent no-op that
+// om-core reports as success, so a successful ActivationResult does not
+// guarantee the ticket can still be matched. Callers that track ticket
+// lifetimes (such as mmqueue's expiry sweep) must expire such tickets
+// themselves.
 func (rc *RestfulOMGrpcClient) ActivateTicketsWithResults(ctx context.Context, ticketIdsToActivate <-chan string, resultsChan chan<- ActivationResult) {
 	caller := "unspecified"
 	if label, ok := ctx.Value(activationTypeContextKey{}).(string); ok && label != "" {

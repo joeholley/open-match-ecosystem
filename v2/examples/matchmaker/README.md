@@ -45,6 +45,8 @@ gcloud builds submit --async --no-source \
 
 The `om-core` URL (`_OM_CORE_ADDR`) must be the exact `https://` URL of the `om-core` Cloud Run service, because when running on Cloud Run (detected via the `K_REVISION` environment variable that Cloud Run sets), the matchmaker authenticates with an ID token whose audience is that URL. The MMF URLs (the `fifo` URL in `_SOLODUEL_ADDR`, and the `debug` URL if the `debug` MMF is enabled through the `_DEBUGMMF_ADDR` substitution) must also use `https://`, because `om-core` only authenticates to MMFs (with its own identity, which needs `roles/run.invoker` on them) when the scheme is `https`.
 
+**Private Google Access**: `om-core` v2.1.0 deploys with `--ingress internal`, and this service reaches its `*.run.app` URL (and Google APIs such as Pub/Sub) through Direct VPC egress (`--network=default --subnet=default --vpc-egress=all-traffic`). That only works if the `default` subnet has Private Google Access enabled and this service runs in the same project / VPC Service Controls perimeter as `om-core`: `gcloud compute networks subnets update default --region=${REGION} --enable-private-ip-google-access`.
+
 ### `deploy/cloudbuild.yaml` Substitutions
 
 | Substitution | Default | Description |

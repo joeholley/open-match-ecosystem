@@ -45,8 +45,10 @@ import (
 // Each attempt is bounded by OM_CORE_REQUEST_TIMEOUT_MS. Transport errors,
 // timeouts, 429s and 5xx responses (including om-core's partial-failure
 // Internal status) are retried with exponential backoff for up to three attempt
-// timeouts; other errors, such as InvalidArgument for malformed or unknown
-// ticket IDs, are returned immediately.
+// timeouts; other errors, such as InvalidArgument for malformed ticket IDs, are
+// returned immediately. Well-formed ticket IDs that om-core does not know (for
+// example, expired, evicted, or never-created tickets) are a silent no-op on
+// om-core and succeed.
 func (rc *RestfulOMGrpcClient) DeactivateTickets(ctx context.Context, ticketIDs []string) error {
 	ids := deduplicateTicketIDs(ticketIDs)
 	if len(ids) == 0 {
